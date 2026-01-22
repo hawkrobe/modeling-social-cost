@@ -1,0 +1,117 @@
+// WebPPL Implementation of the Model - can be run on webppl.org
+
+// Expanded personae with moderate positions
+var personae = [
+  {name: "BB", conservative: true, bioessentialist: true, moderate: false, progressive: false},
+  {name: "CJ", conservative: true, bioessentialist: false, moderate: false, progressive: false},
+  {name: "BioessentialistModerate", conservative: false, moderate: true, progressive: false, bioessentialist: true},
+  {name: "TransAffirmingModerate", conservative: false, moderate: true, progressive: false, bioessentialist: false},
+  {name: "TERF", conservative: false, moderate: false, progressive: true, bioessentialist: true},
+  {name: "PinkNews", conservative: false, moderate: false, progressive: true, bioessentialist: false}
+]
+
+// Table 2 (6 now)
+var NPRPriors = Categorical({ps: [.1, .1, .15, .45, .15, .15], vs: personae})
+
+var personaePrior = NPRPriors
+
+var variants = ["BiologicalMale","TransgenderWoman", "TransWoman"]
+
+// Cost using utterance frequency (data from NOW) -log2(frequency)
+var cost = {
+  BiologicalMale : -12.05, // 
+  TransgenderWoman : -14.62, // 
+  TransWoman: -14.85, // 
+}
+
+var semantics = {
+  BiologicalMale: function(persona) { 
+    return (persona.conservative == true || persona.bioessentialist == true) 
+  },
+  TransWoman: function(persona) { 
+    return (persona.bioessentialist == false)
+  },
+  TransgenderWoman: function(persona) { 
+    return true // acceptable to all
+  }
+}
+
+// Definition in (11) - the 'literal listener'
+
+var conditionalization = function(variant) {
+  return Infer({model: function(){
+    var persona = sample(personaePrior)
+    var meaning = semantics[variant]
+    condition(meaning(persona))
+    return persona
+  }}
+)} 
+
+// New Parameters 
+
+var socialWeight = 0.5
+var costWeight = 1 - socialWeight
+
+// Definition in (12)
+
+var utility = function(persona, variant) {
+  
+  var informativity = conditionalization(variant).score(persona)
+  return((informativity * socialWeight) - (cost[variant] * costWeight))
+  
+}
+
+var alpha = 1
+
+// Definition in (13) - soft-max choice rule
+
+var speaker = function(persona) {
+  return Infer(function() { 
+   var variant = uniformDraw(variants)
+  factor(alpha * utility(persona,variant))
+  return(variant)
+  }) 
+}
+
+// Definition in (18): Naive listening 
+
+var naiveListener = function(variant) {
+  return Infer(function(){
+  
+  var persona = sample(personaePrior)
+  factor(speaker(persona).score(variant))
+  return persona.name
+  }) 
+}
+
+// Real Values for Comparison
+var real = {
+  breitbart : {
+    BiologicalMale: 331 ,
+    TransWoman: 105,
+    TransgenderWoman: 301
+  },
+  npr : {
+    BiologicalMale: 0,
+    TransWoman: 91,
+    TransgenderWoman: 200
+  },
+  pinknews : {
+    BiologicalMale: 0,
+    TransWoman: 5978,
+    TransgenderWoman: 1900
+  },
+}
+
+
+window.print("TransAffirmingModerate: Moderate, Gender-Progressive")
+viz.table(speaker(personae[3]))
+
+print("Literal L's beliefs immediately after hearing biological male")
+viz.table(conditionalization('BiologicalMale'))
+
+print("Literal L's beliefs immediately after hearing transgender woman")
+viz.table(conditionalization('TransgenderWoman'))
+
+print("Literal L's beliefs immediately after hearing trans woman")
+viz.table(conditionalization('TransWoman'))
