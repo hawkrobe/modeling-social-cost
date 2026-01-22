@@ -382,18 +382,3 @@ plt.savefig("ablation_cost.png", dpi=150, bbox_inches="tight")
 plt.show()
 ```
 
-## Summary
-
-1. **Outlet-specific costs are the major driver** of model fit (Δ RMSE = +0.092)
-   - "biological male" is accessible at Breitbart, costly at PinkNews
-   - "trans woman" is accessible at PinkNews, costly at Breitbart
-
-2. **Hierarchical persona structure provides modest additional gain** (Δ RMSE = +0.003)
-   - Theoretically motivated: political orientation predicts gender ideology
-   - Reduces parameters: 12 vs 18 for flat priors
-   - Captures "cost of misidentification": using wrong term signals wrong politics
-
-3. **Model limitations**:
-   - Predicts ~5% "biological male" at PinkNews/NPR where observed is 0%
-   - Over-predicts "biological male" at Breitbart (61% vs 45%)
-   - Parameters (α, weights, costs) are hand-set, not fit to data
