@@ -1,6 +1,5 @@
 ---
-title: "Chapter 2: RSA Model Simulations"
-subtitle: "Comparing model variants for transgender referring expressions"
+title: "RSA Model Simulations"
 format:
   html:
     code-fold: true

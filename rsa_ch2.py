@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-RSA Model for Transgender Referring Expressions (Chapter 2)
-
-Models RE choice using two social pathways:
-  1. Social signaling: REs index speaker's social persona (informativity)
-  2. Social accessibility: Community-frequent terms are easier to produce (cost)
+Dual-pathway RSA model for socially-indexed referring expressions.
 
 Usage:
     python rsa_ch2.py --compare     # Compare model variants
