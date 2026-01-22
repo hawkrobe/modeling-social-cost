@@ -1,0 +1,400 @@
+---
+title: "Chapter 2: RSA Model Simulations"
+subtitle: "Comparing model variants for transgender referring expressions"
+format:
+  html:
+    code-fold: true
+    fig-width: 10
+    fig-height: 6
+---
+
+```{python}
+#| label: setup
+#| message: false
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+sns.set_theme(style="whitegrid")
+```
+
+## Observed Data
+
+Raw counts from corpus analysis:
+
+```{python}
+#| label: observed-data
+
+raw_counts = {
+    "Breitbart": {"biological male": 331, "transgender woman": 301, "trans woman": 105},
+    "NPR": {"biological male": 0, "transgender woman": 200, "trans woman": 91},
+    "PinkNews": {"biological male": 0, "transgender woman": 1900, "trans woman": 5978},
+}
+
+# Convert to proportions
+observed = {}
+for outlet, counts in raw_counts.items():
+    total = sum(counts.values())
+    observed[outlet] = {k: v/total for k, v in counts.items()}
+    print(f"{outlet} (N={total}):")
+    for term, prop in observed[outlet].items():
+        print(f"  {term}: {prop:.1%}")
+    print()
+```
+
+## Model Components
+
+### Personae
+
+Six personae crossing political orientation (conservative/moderate/progressive) with gender ideology (bioessentialist/trans-affirming):
+
+| Persona | Political | Gender Ideology |
+|---------|-----------|-----------------|
+| BB | Conservative | Bioessentialist |
+| CJ | Conservative | Trans-affirming |
+| BioMod | Moderate | Bioessentialist |
+| TransMod | Moderate | Trans-affirming |
+| TERF | Progressive | Bioessentialist |
+| PN | Progressive | Trans-affirming |
+
+### Semantic Compatibility
+
+Who can felicitously use each term:
+
+- **"biological male"** → conservative OR bioessentialist
+- **"trans woman"** → NOT bioessentialist (trans-affirming only)
+- **"transgender woman"** → anyone (neutral)
+
+```{python}
+#| label: model-setup
+
+# Compatibility matrix: personae × utterances
+# Rows: BB, CJ, BioMod, TransMod, TERF, PN
+# Cols: biological male, transgender woman, trans woman
+COMPAT = np.array([
+    [1, 1, 0],  # BB: can use BM, TGW; not TW
+    [1, 1, 1],  # CJ: can use all (conservative but trans-affirming)
+    [1, 1, 0],  # BioMod: can use BM, TGW; not TW
+    [0, 1, 1],  # TransMod: can use TGW, TW; not BM
+    [1, 1, 0],  # TERF: can use BM, TGW; not TW
+    [0, 1, 1],  # PN: can use TGW, TW; not BM
+], dtype=float)
+
+UTTERANCES = ["biological male", "transgender woman", "trans woman"]
+PERSONAE = ["BB", "CJ", "BioMod", "TransMod", "TERF", "PN"]
+OUTLETS = ["Breitbart", "NPR", "PinkNews"]
+```
+
+### Priors
+
+**Flat priors**: Hand-specified 6-way distribution per outlet.
+
+**Hierarchical priors**: $P(\text{persona}) = P(\text{pol}) \times P(\text{bio}|\text{pol})$
+
+The hierarchical structure encodes the empirical correlation between political orientation and gender ideology:
+
+- $P(\text{bioessentialist}|\text{conservative}) = 0.85$
+- $P(\text{bioessentialist}|\text{moderate}) = 0.40$
+- $P(\text{bioessentialist}|\text{progressive}) = 0.15$
+
+```{python}
+#| label: priors
+
+# Flat priors (hand-specified)
+def normalize(x):
+    return x / x.sum()
+
+FLAT_PRIORS = {
+    "Breitbart": normalize(np.array([.60, .15, .13, .10, .01, .01])),
+    "PinkNews":  normalize(np.array([.01, .01, .10, .25, .13, .60])),
+    "NPR":       normalize(np.array([.10, .10, .15, .45, .15, .15])),
+}
+
+# Hierarchical priors
+P_POL = {
+    "Breitbart": {"con": .75, "mod": .20, "prog": .05},
+    "PinkNews":  {"con": .02, "mod": .18, "prog": .80},
+    "NPR":       {"con": .15, "mod": .55, "prog": .30},
+}
+P_BIO_GIVEN_POL = {"con": .85, "mod": .40, "prog": .15}
+
+def hier_prior(outlet):
+    p, b = P_POL[outlet], P_BIO_GIVEN_POL
+    prior = np.array([
+        p["con"]*b["con"], p["con"]*(1-b["con"]),
+        p["mod"]*b["mod"], p["mod"]*(1-b["mod"]),
+        p["prog"]*b["prog"], p["prog"]*(1-b["prog"]),
+    ])
+    return prior / prior.sum()
+
+HIER_PRIORS = {o: hier_prior(o) for o in OUTLETS}
+
+# Display
+print("Hierarchical priors:")
+for outlet in OUTLETS:
+    print(f"\n{outlet}:")
+    for i, p in enumerate(PERSONAE):
+        print(f"  {p}: {HIER_PRIORS[outlet][i]:.3f}")
+```
+
+### Costs
+
+**General costs**: From corpus frequency (NOW corpus).
+
+**Outlet-specific costs**: Socially mediated accessibility — terms common in your community are cheaper to produce.
+
+```{python}
+#| label: costs
+
+COST_GENERAL = np.array([-12.05, -14.62, -14.85])
+
+# More negative = more accessible
+COST_OUTLET = {
+    "Breitbart": np.array([-16., -14., -12.]),  # "biological male" most accessible
+    "PinkNews":  np.array([-10., -14., -17.]),  # "trans woman" most accessible
+    "NPR":       np.array([-11., -16., -14.]),  # "transgender woman" most accessible
+}
+
+print("Outlet-specific costs (more negative = more accessible):")
+for outlet in OUTLETS:
+    print(f"\n{outlet}:")
+    for i, u in enumerate(UTTERANCES):
+        print(f"  {u}: {COST_OUTLET[outlet][i]:.1f}")
+```
+
+## RSA Model
+
+```{python}
+#| label: rsa-model
+
+ALPHA = 1.0
+SOCIAL_W = 0.5
+COST_W = 0.5
+
+def L0(prior, compat):
+    """Literal listener: P(persona | utterance)"""
+    # For each utterance, compute posterior over personae
+    # P(p|u) ∝ P(p) × compat(p,u)
+    L0_dist = np.zeros((3, 6))  # utterances × personae
+    for u in range(3):
+        weights = prior * compat[:, u]
+        if weights.sum() > 0:
+            L0_dist[u] = weights / weights.sum()
+        else:
+            L0_dist[u] = np.ones(6) / 6
+    return L0_dist
+
+def S1(prior, costs, compat):
+    """Pragmatic speaker: P(utterance | persona)"""
+    L0_dist = L0(prior, compat)
+    S1_dist = np.zeros((6, 3))  # personae × utterances
+
+    for p in range(6):
+        weights = np.zeros(3)
+        for u in range(3):
+            if compat[p, u] > 0:
+                info = np.log(L0_dist[u, p] + 1e-10)
+                util = SOCIAL_W * info - COST_W * costs[u]
+                weights[u] = np.exp(ALPHA * util)
+        if weights.sum() > 0:
+            S1_dist[p] = weights / weights.sum()
+    return S1_dist
+
+def production(prior, costs, compat):
+    """Expected production: P(utt) = Σ_p P(p) × S1(utt|p)"""
+    S1_dist = S1(prior, costs, compat)
+    return prior @ S1_dist
+
+def run_model(prior, costs):
+    pred = production(prior, costs, COMPAT)
+    return {UTTERANCES[i]: pred[i] for i in range(3)}
+```
+
+## Model Comparison
+
+```{python}
+#| label: run-models
+
+def rmse(pred, obs):
+    return np.sqrt(np.mean([(pred[u] - obs[u])**2 for u in UTTERANCES]))
+
+# Run all 4 model variants
+results = []
+
+for prior_type, priors in [("Flat", FLAT_PRIORS), ("Hierarchical", HIER_PRIORS)]:
+    for cost_type, costs in [("General", {o: COST_GENERAL for o in OUTLETS}),
+                              ("Outlet-specific", COST_OUTLET)]:
+        model_name = f"{prior_type} + {cost_type}"
+
+        for outlet in OUTLETS:
+            pred = run_model(priors[outlet], costs[outlet])
+            obs = observed[outlet]
+
+            for utt in UTTERANCES:
+                results.append({
+                    "Model": model_name,
+                    "Prior": prior_type,
+                    "Cost": cost_type,
+                    "Outlet": outlet,
+                    "Utterance": utt,
+                    "Predicted": pred[utt],
+                    "Observed": obs[utt],
+                    "Error": pred[utt] - obs[utt]
+                })
+
+df = pd.DataFrame(results)
+```
+
+### RMSE Summary
+
+```{python}
+#| label: rmse-table
+
+rmse_summary = df.groupby(["Model", "Outlet"]).apply(
+    lambda g: np.sqrt(np.mean(g["Error"]**2))
+).unstack()
+rmse_summary["Average"] = rmse_summary.mean(axis=1)
+rmse_summary = rmse_summary.round(4)
+print(rmse_summary.to_string())
+```
+
+### Contribution Decomposition
+
+```{python}
+#| label: decomposition
+
+baseline = rmse_summary.loc["Flat + General", "Average"]
+with_outlet = rmse_summary.loc["Flat + Outlet-specific", "Average"]
+with_hier = rmse_summary.loc["Hierarchical + General", "Average"]
+full = rmse_summary.loc["Hierarchical + Outlet-specific", "Average"]
+
+print(f"Baseline (Flat + General):        {baseline:.4f}")
+print(f"")
+print(f"+ Outlet-specific costs:          {with_outlet:.4f}  (Δ = {baseline - with_outlet:+.4f})")
+print(f"+ Hierarchical priors:            {with_hier:.4f}  (Δ = {baseline - with_hier:+.4f})")
+print(f"+ Both:                           {full:.4f}  (Δ = {baseline - full:+.4f})")
+```
+
+## Visualizations
+
+### Observed vs Predicted by Model Variant
+
+```{python}
+#| label: fig-comparison
+#| fig-cap: "Observed vs predicted proportions across model variants"
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+axes = axes.flatten()
+
+models = df["Model"].unique()
+colors = {"biological male": "#e74c3c", "transgender woman": "#3498db", "trans woman": "#2ecc71"}
+
+for ax, model in zip(axes, models):
+    model_df = df[df["Model"] == model]
+
+    x = np.arange(len(OUTLETS))
+    width = 0.25
+
+    for i, utt in enumerate(UTTERANCES):
+        utt_df = model_df[model_df["Utterance"] == utt]
+        obs = utt_df["Observed"].values
+        pred = utt_df["Predicted"].values
+
+        # Observed (solid)
+        ax.bar(x + i*width - width, obs, width*0.8,
+               color=colors[utt], alpha=0.8, label=f"{utt} (obs)" if ax == axes[0] else "")
+        # Predicted (hatched)
+        ax.bar(x + i*width - width, pred, width*0.8,
+               color="none", edgecolor=colors[utt], linewidth=2, hatch="//",
+               label=f"{utt} (pred)" if ax == axes[0] else "")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(OUTLETS)
+    ax.set_ylabel("Proportion")
+    ax.set_ylim(0, 1)
+
+    # Add RMSE to title
+    model_rmse = rmse_summary.loc[model, "Average"]
+    ax.set_title(f"{model}\n(RMSE = {model_rmse:.3f})")
+
+axes[0].legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=9)
+plt.tight_layout()
+plt.savefig("model_comparison.png", dpi=150, bbox_inches="tight")
+plt.show()
+```
+
+### Error by Outlet and Utterance
+
+```{python}
+#| label: fig-errors
+#| fig-cap: "Prediction errors (predicted - observed) by model variant"
+
+fig, ax = plt.subplots(figsize=(12, 6))
+
+# Best model only
+best_df = df[df["Model"] == "Hierarchical + Outlet-specific"].copy()
+best_df["Outlet_Utt"] = best_df["Outlet"] + "\n" + best_df["Utterance"]
+
+colors_list = [colors[u] for u in best_df["Utterance"]]
+bars = ax.bar(range(len(best_df)), best_df["Error"], color=colors_list, alpha=0.8)
+ax.axhline(0, color="black", linewidth=0.5)
+ax.set_xticks(range(len(best_df)))
+ax.set_xticklabels(best_df["Outlet_Utt"], rotation=45, ha="right")
+ax.set_ylabel("Error (Predicted - Observed)")
+ax.set_title("Best Model: Hierarchical + Outlet-specific Costs")
+
+plt.tight_layout()
+plt.savefig("prediction_errors.png", dpi=150, bbox_inches="tight")
+plt.show()
+```
+
+### Ablation: Cost Effect
+
+```{python}
+#| label: fig-ablation-cost
+#| fig-cap: "Effect of outlet-specific costs (holding priors fixed at hierarchical)"
+
+fig, axes = plt.subplots(1, 3, figsize=(14, 4), sharey=True)
+
+for ax, outlet in zip(axes, OUTLETS):
+    general_df = df[(df["Model"] == "Hierarchical + General") & (df["Outlet"] == outlet)]
+    outlet_df = df[(df["Model"] == "Hierarchical + Outlet-specific") & (df["Outlet"] == outlet)]
+    obs_df = general_df  # same observed values
+
+    x = np.arange(len(UTTERANCES))
+    width = 0.25
+
+    ax.bar(x - width, obs_df["Observed"].values, width, label="Observed", color="gray", alpha=0.8)
+    ax.bar(x, general_df["Predicted"].values, width, label="General cost", color="#9b59b6", alpha=0.8)
+    ax.bar(x + width, outlet_df["Predicted"].values, width, label="Outlet cost", color="#f39c12", alpha=0.8)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(["BM", "TGW", "TW"])
+    ax.set_title(outlet)
+    ax.set_ylim(0, 1)
+
+axes[0].set_ylabel("Proportion")
+axes[0].legend()
+plt.suptitle("Effect of Outlet-Specific Costs", fontsize=14, y=1.02)
+plt.tight_layout()
+plt.savefig("ablation_cost.png", dpi=150, bbox_inches="tight")
+plt.show()
+```
+
+## Summary
+
+1. **Outlet-specific costs are the major driver** of model fit (Δ RMSE = +0.092)
+   - "biological male" is accessible at Breitbart, costly at PinkNews
+   - "trans woman" is accessible at PinkNews, costly at Breitbart
+
+2. **Hierarchical persona structure provides modest additional gain** (Δ RMSE = +0.003)
+   - Theoretically motivated: political orientation predicts gender ideology
+   - Reduces parameters: 12 vs 18 for flat priors
+   - Captures "cost of misidentification": using wrong term signals wrong politics
+
+3. **Model limitations**:
+   - Predicts ~5% "biological male" at PinkNews/NPR where observed is 0%
+   - Over-predicts "biological male" at Breitbart (61% vs 45%)
+   - Parameters (α, weights, costs) are hand-set, not fit to data
