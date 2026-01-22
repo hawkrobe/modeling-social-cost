@@ -1,0 +1,7 @@
+memo-lang
+jax
+jaxlib
+numpy
+pandas
+matplotlib
+seaborn
