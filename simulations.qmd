@@ -19,12 +19,10 @@ import seaborn as sns
 sns.set_theme(style="whitegrid")
 ```
 
-## Observed Data
-
-Raw counts from corpus analysis:
+## Data
 
 ```{python}
-#| label: observed-data
+#| label: data
 
 raw_counts = {
     "Breitbart": {"biological male": 331, "transgender woman": 301, "trans woman": 105},
@@ -32,86 +30,49 @@ raw_counts = {
     "PinkNews": {"biological male": 0, "transgender woman": 1900, "trans woman": 5978},
 }
 
-# Convert to proportions
 observed = {}
 for outlet, counts in raw_counts.items():
     total = sum(counts.values())
     observed[outlet] = {k: v/total for k, v in counts.items()}
-    print(f"{outlet} (N={total}):")
-    for term, prop in observed[outlet].items():
-        print(f"  {term}: {prop:.1%}")
-    print()
-```
-
-## Model Components
-
-### Personae
-
-Six personae crossing political orientation (conservative/moderate/progressive) with gender ideology (bioessentialist/trans-affirming):
-
-| Persona | Political | Gender Ideology |
-|---------|-----------|-----------------|
-| BB | Conservative | Bioessentialist |
-| CJ | Conservative | Trans-affirming |
-| BioMod | Moderate | Bioessentialist |
-| TransMod | Moderate | Trans-affirming |
-| TERF | Progressive | Bioessentialist |
-| PN | Progressive | Trans-affirming |
-
-### Semantic Compatibility
-
-Who can felicitously use each term:
-
-- **"biological male"** → conservative OR bioessentialist
-- **"trans woman"** → NOT bioessentialist (trans-affirming only)
-- **"transgender woman"** → anyone (neutral)
-
-```{python}
-#| label: model-setup
-
-# Compatibility matrix: personae × utterances
-# Rows: BB, CJ, BioMod, TransMod, TERF, PN
-# Cols: biological male, transgender woman, trans woman
-COMPAT = np.array([
-    [1, 1, 0],  # BB: can use BM, TGW; not TW
-    [1, 1, 1],  # CJ: can use all (conservative but trans-affirming)
-    [1, 1, 0],  # BioMod: can use BM, TGW; not TW
-    [0, 1, 1],  # TransMod: can use TGW, TW; not BM
-    [1, 1, 0],  # TERF: can use BM, TGW; not TW
-    [0, 1, 1],  # PN: can use TGW, TW; not BM
-], dtype=float)
 
 UTTERANCES = ["biological male", "transgender woman", "trans woman"]
 PERSONAE = ["BB", "CJ", "BioMod", "TransMod", "TERF", "PN"]
 OUTLETS = ["Breitbart", "NPR", "PinkNews"]
 ```
 
-### Priors
-
-**Flat priors**: Hand-specified 6-way distribution per outlet.
-
-**Hierarchical priors**: $P(\text{persona}) = P(\text{pol}) \times P(\text{bio}|\text{pol})$
-
-The hierarchical structure encodes the empirical correlation between political orientation and gender ideology:
-
-- $P(\text{bioessentialist}|\text{conservative}) = 0.85$
-- $P(\text{bioessentialist}|\text{moderate}) = 0.40$
-- $P(\text{bioessentialist}|\text{progressive}) = 0.15$
+## Model Components
 
 ```{python}
-#| label: priors
+#| label: model-components
 
-# Flat priors (hand-specified)
-def normalize(x):
-    return x / x.sum()
+# Semantic compatibility: who can use what
+# "biological male" → conservative OR bioessentialist
+# "trans woman" → trans-affirming only
+# "transgender woman" → anyone
+COMPAT = np.array([
+    [1, 1, 0],  # BB
+    [1, 1, 1],  # CJ
+    [1, 1, 0],  # BioMod
+    [0, 1, 1],  # TransMod
+    [1, 1, 0],  # TERF
+    [0, 1, 1],  # PN
+], dtype=float)
 
+# No semantics (anyone can use anything)
+NO_COMPAT = np.ones((6, 3), dtype=float)
+
+# Uniform priors
+UNIFORM_PRIOR = np.ones(6) / 6
+
+# Flat priors (hand-specified per outlet)
+def normalize(x): return x / x.sum()
 FLAT_PRIORS = {
     "Breitbart": normalize(np.array([.60, .15, .13, .10, .01, .01])),
     "PinkNews":  normalize(np.array([.01, .01, .10, .25, .13, .60])),
     "NPR":       normalize(np.array([.10, .10, .15, .45, .15, .15])),
 }
 
-# Hierarchical priors
+# Hierarchical priors: P(persona) = P(pol) × P(bio|pol)
 P_POL = {
     "Breitbart": {"con": .75, "mod": .20, "prog": .05},
     "PinkNews":  {"con": .02, "mod": .18, "prog": .80},
@@ -130,37 +91,14 @@ def hier_prior(outlet):
 
 HIER_PRIORS = {o: hier_prior(o) for o in OUTLETS}
 
-# Display
-print("Hierarchical priors:")
-for outlet in OUTLETS:
-    print(f"\n{outlet}:")
-    for i, p in enumerate(PERSONAE):
-        print(f"  {p}: {HIER_PRIORS[outlet][i]:.3f}")
-```
-
-### Costs
-
-**General costs**: From corpus frequency (NOW corpus).
-
-**Outlet-specific costs**: Socially mediated accessibility — terms common in your community are cheaper to produce.
-
-```{python}
-#| label: costs
-
+# Costs
+COST_ZERO = np.zeros(3)
 COST_GENERAL = np.array([-12.05, -14.62, -14.85])
-
-# More negative = more accessible
 COST_OUTLET = {
-    "Breitbart": np.array([-16., -14., -12.]),  # "biological male" most accessible
-    "PinkNews":  np.array([-10., -14., -17.]),  # "trans woman" most accessible
-    "NPR":       np.array([-11., -16., -14.]),  # "transgender woman" most accessible
+    "Breitbart": np.array([-16., -14., -12.]),
+    "PinkNews":  np.array([-10., -14., -17.]),
+    "NPR":       np.array([-11., -16., -14.]),
 }
-
-print("Outlet-specific costs (more negative = more accessible):")
-for outlet in OUTLETS:
-    print(f"\n{outlet}:")
-    for i, u in enumerate(UTTERANCES):
-        print(f"  {u}: {COST_OUTLET[outlet][i]:.1f}")
 ```
 
 ## RSA Model
@@ -169,14 +107,10 @@ for outlet in OUTLETS:
 #| label: rsa-model
 
 ALPHA = 1.0
-SOCIAL_W = 0.5
-COST_W = 0.5
 
 def L0(prior, compat):
     """Literal listener: P(persona | utterance)"""
-    # For each utterance, compute posterior over personae
-    # P(p|u) ∝ P(p) × compat(p,u)
-    L0_dist = np.zeros((3, 6))  # utterances × personae
+    L0_dist = np.zeros((3, 6))
     for u in range(3):
         weights = prior * compat[:, u]
         if weights.sum() > 0:
@@ -185,200 +119,171 @@ def L0(prior, compat):
             L0_dist[u] = np.ones(6) / 6
     return L0_dist
 
-def S1(prior, costs, compat):
+def S1(prior, costs, compat, social_w=0.5, cost_w=0.5):
     """Pragmatic speaker: P(utterance | persona)"""
     L0_dist = L0(prior, compat)
-    S1_dist = np.zeros((6, 3))  # personae × utterances
-
+    S1_dist = np.zeros((6, 3))
     for p in range(6):
         weights = np.zeros(3)
         for u in range(3):
             if compat[p, u] > 0:
                 info = np.log(L0_dist[u, p] + 1e-10)
-                util = SOCIAL_W * info - COST_W * costs[u]
+                util = social_w * info - cost_w * costs[u]
                 weights[u] = np.exp(ALPHA * util)
         if weights.sum() > 0:
             S1_dist[p] = weights / weights.sum()
     return S1_dist
 
-def production(prior, costs, compat):
+def production(prior, costs, compat, social_w=0.5, cost_w=0.5):
     """Expected production: P(utt) = Σ_p P(p) × S1(utt|p)"""
-    S1_dist = S1(prior, costs, compat)
+    S1_dist = S1(prior, costs, compat, social_w, cost_w)
     return prior @ S1_dist
 
-def run_model(prior, costs):
-    pred = production(prior, costs, COMPAT)
+def run_model(prior, costs, compat=COMPAT, social_w=0.5, cost_w=0.5):
+    pred = production(prior, costs, compat, social_w, cost_w)
     return {UTTERANCES[i]: pred[i] for i in range(3)}
+
+def rmse(pred, obs):
+    return np.sqrt(np.mean([(pred[u] - obs[u])**2 for u in UTTERANCES]))
 ```
 
 ## Model Comparison
 
 ```{python}
-#| label: run-models
+#| label: run-ablations
 
-def rmse(pred, obs):
-    return np.sqrt(np.mean([(pred[u] - obs[u])**2 for u in UTTERANCES]))
+# Define all model variants
+models = {
+    # Baseline ablations
+    "Uniform + No cost": lambda o: run_model(UNIFORM_PRIOR, COST_ZERO),
+    "Uniform + General cost": lambda o: run_model(UNIFORM_PRIOR, COST_GENERAL),
+    "Uniform + Outlet cost": lambda o: run_model(UNIFORM_PRIOR, COST_OUTLET[o]),
 
-# Run all 4 model variants
+    # Flat prior variants
+    "Flat + No cost": lambda o: run_model(FLAT_PRIORS[o], COST_ZERO),
+    "Flat + General cost": lambda o: run_model(FLAT_PRIORS[o], COST_GENERAL),
+    "Flat + Outlet cost": lambda o: run_model(FLAT_PRIORS[o], COST_OUTLET[o]),
+
+    # Hierarchical prior variants
+    "Hier + No cost": lambda o: run_model(HIER_PRIORS[o], COST_ZERO),
+    "Hier + General cost": lambda o: run_model(HIER_PRIORS[o], COST_GENERAL),
+    "Hier + Outlet cost": lambda o: run_model(HIER_PRIORS[o], COST_OUTLET[o]),
+
+    # No semantics
+    "No semantics": lambda o: run_model(HIER_PRIORS[o], COST_OUTLET[o], compat=NO_COMPAT),
+
+    # Only informativity / only cost
+    "Only informativity": lambda o: run_model(HIER_PRIORS[o], COST_OUTLET[o], social_w=1.0, cost_w=0.0),
+    "Only cost": lambda o: run_model(HIER_PRIORS[o], COST_OUTLET[o], social_w=0.0, cost_w=1.0),
+}
+
+# Run all models
 results = []
-
-for prior_type, priors in [("Flat", FLAT_PRIORS), ("Hierarchical", HIER_PRIORS)]:
-    for cost_type, costs in [("General", {o: COST_GENERAL for o in OUTLETS}),
-                              ("Outlet-specific", COST_OUTLET)]:
-        model_name = f"{prior_type} + {cost_type}"
-
-        for outlet in OUTLETS:
-            pred = run_model(priors[outlet], costs[outlet])
-            obs = observed[outlet]
-
-            for utt in UTTERANCES:
-                results.append({
-                    "Model": model_name,
-                    "Prior": prior_type,
-                    "Cost": cost_type,
-                    "Outlet": outlet,
-                    "Utterance": utt,
-                    "Predicted": pred[utt],
-                    "Observed": obs[utt],
-                    "Error": pred[utt] - obs[utt]
-                })
+for model_name, model_fn in models.items():
+    for outlet in OUTLETS:
+        pred = model_fn(outlet)
+        obs = observed[outlet]
+        r = rmse(pred, obs)
+        results.append({
+            "Model": model_name,
+            "Outlet": outlet,
+            "RMSE": r,
+            **{f"pred_{u}": pred[u] for u in UTTERANCES},
+            **{f"obs_{u}": obs[u] for u in UTTERANCES},
+        })
 
 df = pd.DataFrame(results)
+rmse_df = df.groupby("Model")["RMSE"].mean().sort_values()
 ```
 
-### RMSE Summary
+### RMSE by Model Variant
 
 ```{python}
-#| label: rmse-table
+#| label: fig-rmse
+#| fig-cap: "Average RMSE across outlets for each model variant"
 
-rmse_summary = df.groupby(["Model", "Outlet"]).apply(
-    lambda g: np.sqrt(np.mean(g["Error"]**2))
-).unstack()
-rmse_summary["Average"] = rmse_summary.mean(axis=1)
-rmse_summary = rmse_summary.round(4)
-print(rmse_summary.to_string())
+fig, ax = plt.subplots(figsize=(10, 6))
+
+colors = []
+for m in rmse_df.index:
+    if "Hier + Outlet" in m:
+        colors.append("#2ecc71")  # best model - green
+    elif "Outlet" in m:
+        colors.append("#3498db")  # outlet cost - blue
+    elif "Hier" in m:
+        colors.append("#9b59b6")  # hierarchical - purple
+    elif "Uniform" in m or "No semantics" in m or "Only" in m:
+        colors.append("#95a5a6")  # ablations - gray
+    else:
+        colors.append("#e74c3c")  # flat - red
+
+ax.barh(range(len(rmse_df)), rmse_df.values, color=colors, alpha=0.8)
+ax.set_yticks(range(len(rmse_df)))
+ax.set_yticklabels(rmse_df.index)
+ax.set_xlabel("Average RMSE")
+ax.axvline(rmse_df["Hier + Outlet cost"], color="#2ecc71", linestyle="--", alpha=0.5)
+
+plt.tight_layout()
+plt.savefig("rmse_comparison.png", dpi=150, bbox_inches="tight")
+plt.show()
 ```
 
-### Contribution Decomposition
+### Best Model Predictions
 
 ```{python}
-#| label: decomposition
+#| label: fig-best-model
+#| fig-cap: "Observed vs predicted for best model (Hierarchical + Outlet cost)"
 
-baseline = rmse_summary.loc["Flat + General", "Average"]
-with_outlet = rmse_summary.loc["Flat + Outlet-specific", "Average"]
-with_hier = rmse_summary.loc["Hierarchical + General", "Average"]
-full = rmse_summary.loc["Hierarchical + Outlet-specific", "Average"]
+best_df = df[df["Model"] == "Hier + Outlet cost"].copy()
 
-print(f"Baseline (Flat + General):        {baseline:.4f}")
-print(f"")
-print(f"+ Outlet-specific costs:          {with_outlet:.4f}  (Δ = {baseline - with_outlet:+.4f})")
-print(f"+ Hierarchical priors:            {with_hier:.4f}  (Δ = {baseline - with_hier:+.4f})")
-print(f"+ Both:                           {full:.4f}  (Δ = {baseline - full:+.4f})")
-```
-
-## Visualizations
-
-### Observed vs Predicted by Model Variant
-
-```{python}
-#| label: fig-comparison
-#| fig-cap: "Observed vs predicted proportions across model variants"
-
-fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-axes = axes.flatten()
-
-models = df["Model"].unique()
+fig, axes = plt.subplots(1, 3, figsize=(12, 4), sharey=True)
 colors = {"biological male": "#e74c3c", "transgender woman": "#3498db", "trans woman": "#2ecc71"}
 
-for ax, model in zip(axes, models):
-    model_df = df[df["Model"] == model]
-
-    x = np.arange(len(OUTLETS))
-    width = 0.25
-
-    for i, utt in enumerate(UTTERANCES):
-        utt_df = model_df[model_df["Utterance"] == utt]
-        obs = utt_df["Observed"].values
-        pred = utt_df["Predicted"].values
-
-        # Observed (solid)
-        ax.bar(x + i*width - width, obs, width*0.8,
-               color=colors[utt], alpha=0.8, label=f"{utt} (obs)" if ax == axes[0] else "")
-        # Predicted (hatched)
-        ax.bar(x + i*width - width, pred, width*0.8,
-               color="none", edgecolor=colors[utt], linewidth=2, hatch="//",
-               label=f"{utt} (pred)" if ax == axes[0] else "")
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(OUTLETS)
-    ax.set_ylabel("Proportion")
-    ax.set_ylim(0, 1)
-
-    # Add RMSE to title
-    model_rmse = rmse_summary.loc[model, "Average"]
-    ax.set_title(f"{model}\n(RMSE = {model_rmse:.3f})")
-
-axes[0].legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=9)
-plt.tight_layout()
-plt.savefig("model_comparison.png", dpi=150, bbox_inches="tight")
-plt.show()
-```
-
-### Error by Outlet and Utterance
-
-```{python}
-#| label: fig-errors
-#| fig-cap: "Prediction errors (predicted - observed) by model variant"
-
-fig, ax = plt.subplots(figsize=(12, 6))
-
-# Best model only
-best_df = df[df["Model"] == "Hierarchical + Outlet-specific"].copy()
-best_df["Outlet_Utt"] = best_df["Outlet"] + "\n" + best_df["Utterance"]
-
-colors_list = [colors[u] for u in best_df["Utterance"]]
-bars = ax.bar(range(len(best_df)), best_df["Error"], color=colors_list, alpha=0.8)
-ax.axhline(0, color="black", linewidth=0.5)
-ax.set_xticks(range(len(best_df)))
-ax.set_xticklabels(best_df["Outlet_Utt"], rotation=45, ha="right")
-ax.set_ylabel("Error (Predicted - Observed)")
-ax.set_title("Best Model: Hierarchical + Outlet-specific Costs")
-
-plt.tight_layout()
-plt.savefig("prediction_errors.png", dpi=150, bbox_inches="tight")
-plt.show()
-```
-
-### Ablation: Cost Effect
-
-```{python}
-#| label: fig-ablation-cost
-#| fig-cap: "Effect of outlet-specific costs (holding priors fixed at hierarchical)"
-
-fig, axes = plt.subplots(1, 3, figsize=(14, 4), sharey=True)
-
 for ax, outlet in zip(axes, OUTLETS):
-    general_df = df[(df["Model"] == "Hierarchical + General") & (df["Outlet"] == outlet)]
-    outlet_df = df[(df["Model"] == "Hierarchical + Outlet-specific") & (df["Outlet"] == outlet)]
-    obs_df = general_df  # same observed values
+    outlet_row = best_df[best_df["Outlet"] == outlet].iloc[0]
 
-    x = np.arange(len(UTTERANCES))
-    width = 0.25
+    x = np.arange(3)
+    width = 0.35
 
-    ax.bar(x - width, obs_df["Observed"].values, width, label="Observed", color="gray", alpha=0.8)
-    ax.bar(x, general_df["Predicted"].values, width, label="General cost", color="#9b59b6", alpha=0.8)
-    ax.bar(x + width, outlet_df["Predicted"].values, width, label="Outlet cost", color="#f39c12", alpha=0.8)
+    obs_vals = [outlet_row[f"obs_{u}"] for u in UTTERANCES]
+    pred_vals = [outlet_row[f"pred_{u}"] for u in UTTERANCES]
+
+    ax.bar(x - width/2, obs_vals, width, label="Observed", color="gray", alpha=0.7)
+    ax.bar(x + width/2, pred_vals, width, label="Predicted",
+           color=[colors[u] for u in UTTERANCES], alpha=0.8)
 
     ax.set_xticks(x)
     ax.set_xticklabels(["BM", "TGW", "TW"])
-    ax.set_title(outlet)
+    ax.set_title(f"{outlet}\n(RMSE = {outlet_row['RMSE']:.3f})")
     ax.set_ylim(0, 1)
 
 axes[0].set_ylabel("Proportion")
 axes[0].legend()
-plt.suptitle("Effect of Outlet-Specific Costs", fontsize=14, y=1.02)
 plt.tight_layout()
-plt.savefig("ablation_cost.png", dpi=150, bbox_inches="tight")
+plt.savefig("best_model_predictions.png", dpi=150, bbox_inches="tight")
 plt.show()
 ```
 
+### RMSE by Outlet
+
+```{python}
+#| label: fig-rmse-by-outlet
+#| fig-cap: "RMSE by outlet for key model variants"
+
+key_models = ["Uniform + No cost", "Flat + General cost", "Flat + Outlet cost",
+              "Hier + General cost", "Hier + Outlet cost"]
+key_df = df[df["Model"].isin(key_models)]
+
+fig, ax = plt.subplots(figsize=(10, 5))
+pivot = key_df.pivot(index="Model", columns="Outlet", values="RMSE")
+pivot = pivot.reindex(key_models)
+
+pivot.plot(kind="bar", ax=ax, alpha=0.8)
+ax.set_ylabel("RMSE")
+ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
+ax.legend(title="Outlet")
+
+plt.tight_layout()
+plt.savefig("rmse_by_outlet.png", dpi=150, bbox_inches="tight")
+plt.show()
+```
