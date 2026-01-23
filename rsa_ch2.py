@@ -67,26 +67,36 @@ PRIORS = {o: make_prior(o) for o in OBSERVED}
 # SEMANTICS & COSTS
 # =============================================================================
 
-@jax.jit
-def compat(p, u, eps, insider_eps):
-    """
-    Semantic compatibility: can persona p say utterance u?
+# Semantic constraints (who can say what)
+# Using small epsilon for numerical stability
+EPS = 0.001
 
-    - BM blocked for trans-affirming (eps)
-    - TW blocked for bioessentialist (eps)
-    - TW restricted for non-insider trans-affirming (insider_eps)
-    - TGW available to everyone
-    """
-    # Build compatibility matrix
-    mat = jnp.array([
-        # BM   TGW   TW
-        [1,    1,    eps],         # BB (bio)
-        [eps,  1,    insider_eps], # CJ (trans, not insider)
-        [1,    1,    eps],         # BioMod (bio)
-        [eps,  1,    insider_eps], # TransMod (trans, not insider)
-        [1,    1,    eps],         # TERF (bio)
-        [eps,  1,    1],           # PN (trans, insider)
-    ])
+# With register: TW only available to insider (PN)
+COMPAT_REGISTER = jnp.array([
+    # BM   TGW   TW
+    [1,    1,    EPS],  # BB (bio)
+    [EPS,  1,    EPS],  # CJ (trans, not insider)
+    [1,    1,    EPS],  # BioMod (bio)
+    [EPS,  1,    EPS],  # TransMod (trans, not insider)
+    [1,    1,    EPS],  # TERF (bio)
+    [EPS,  1,    1],    # PN (trans, insider)
+], dtype=float)
+
+# Without register: TW available to all trans-affirming
+COMPAT_NO_REGISTER = jnp.array([
+    # BM   TGW   TW
+    [1,    1,    EPS],  # BB (bio)
+    [EPS,  1,    1],    # CJ (trans)
+    [1,    1,    EPS],  # BioMod (bio)
+    [EPS,  1,    1],    # TransMod (trans)
+    [1,    1,    EPS],  # TERF (bio)
+    [EPS,  1,    1],    # PN (trans)
+], dtype=float)
+
+@jax.jit
+def compat(p, u, use_register):
+    """Semantic compatibility with hard constraints."""
+    mat = jnp.where(use_register, COMPAT_REGISTER, COMPAT_NO_REGISTER)
     return mat[p, u]
 
 COSTS = jnp.array([0.5, 0.6, 0.0])  # BM, TGW, TW (length-based)
@@ -104,13 +114,13 @@ def prior_wpp(p, prior):
     return prior[p]
 
 @memo
-def S1[p: P, u: U](alpha, cost_w, eps, insider_eps, prior: ...):
+def S1[p: P, u: U](alpha, cost_w, use_register, prior: ...):
     """S1 speaker: choose utterance to be correctly identified."""
     speaker: knows(p)
     speaker: thinks[
         listener: thinks[
             speaker: given(p in P, wpp=prior_wpp(p, prior)),
-            speaker: chooses(u in U, wpp=compat(p, u, eps, insider_eps))
+            speaker: chooses(u in U, wpp=compat(p, u, use_register))
         ]
     ]
     speaker: chooses(u in U, wpp=exp(alpha * imagine[
@@ -127,10 +137,10 @@ def S1[p: P, u: U](alpha, cost_w, eps, insider_eps, prior: ...):
 # PREDICTION
 # =============================================================================
 
-def predict(outlet, alpha, cost_w, eps, insider_eps):
+def predict(outlet, alpha, cost_w, use_register):
     """Predict utterance distribution at an outlet."""
     prior = PRIORS[outlet]
-    s1 = S1(alpha, cost_w, eps, insider_eps, prior=prior)
+    s1 = S1(alpha, cost_w, float(use_register), prior=prior)
     # Marginalize over personas
     production = jnp.sum(prior[:, None] * s1, axis=0)
     return np.array(production)
@@ -138,11 +148,11 @@ def predict(outlet, alpha, cost_w, eps, insider_eps):
 def rmse(pred, obs):
     return float(np.sqrt(np.mean((np.array(pred) - np.array(obs))**2)))
 
-def total_rmse(params):
-    alpha, cost_w, eps, insider_eps = params
+def total_rmse(params, use_register):
+    alpha, cost_w = params
     total = 0
     for outlet in OBSERVED:
-        pred = predict(outlet, alpha, cost_w, eps, insider_eps)
+        pred = predict(outlet, alpha, cost_w, use_register)
         total += rmse(pred, OBSERVED[outlet])
     return total / len(OBSERVED)
 
@@ -150,34 +160,24 @@ def total_rmse(params):
 # FITTING
 # =============================================================================
 
-def fit_model(use_insider=True, n_starts=5):
-    """Fit with scipy optimize."""
-    bounds = [(0.1, 20), (0, 20), (0.0001, 0.3),
-              (0.0001, 1.0) if use_insider else (1.0, 1.0)]
+def fit_model(use_register=True, n_starts=5):
+    """Fit alpha and cost_w with scipy optimize."""
+    bounds = [(0.1, 20), (0, 20)]
 
     best_rmse = float('inf')
     best_x = None
 
     np.random.seed(42)
     for _ in range(n_starts):
-        x0 = [
-            np.random.uniform(1, 5),
-            np.random.uniform(0, 5),
-            np.random.uniform(0.001, 0.1),
-            np.random.uniform(0.1, 0.5) if use_insider else 1.0,
-        ]
-        result = minimize(total_rmse, x0, method='L-BFGS-B', bounds=bounds,
+        x0 = [np.random.uniform(1, 5), np.random.uniform(0, 5)]
+        result = minimize(total_rmse, x0, args=(use_register,),
+                         method='L-BFGS-B', bounds=bounds,
                          options={'maxiter': 200})
         if result.fun < best_rmse:
             best_rmse = result.fun
             best_x = result.x
 
-    return best_rmse, {
-        'alpha': best_x[0],
-        'cost_w': best_x[1],
-        'eps': best_x[2],
-        'insider_eps': best_x[3]
-    }
+    return best_rmse, {'alpha': best_x[0], 'cost_w': best_x[1]}
 
 # =============================================================================
 # ABLATIONS
@@ -187,11 +187,11 @@ def run_ablations(outpath="ablations.csv"):
     """Compare model with vs without register."""
     results = []
 
-    for use_insider, name in [(False, "No Register"), (True, "With Register")]:
-        avg_rmse, params = fit_model(use_insider=use_insider)
+    for use_register, name in [(False, "No Register"), (True, "With Register")]:
+        avg_rmse, params = fit_model(use_register=use_register)
 
         for outlet in OBSERVED:
-            pred = predict(outlet, **params)
+            pred = predict(outlet, params['alpha'], params['cost_w'], use_register)
             obs = OBSERVED[outlet]
             r = rmse(pred, obs)
 
@@ -199,8 +199,6 @@ def run_ablations(outpath="ablations.csv"):
                 "model": name,
                 "alpha": params['alpha'],
                 "cost_w": params['cost_w'],
-                "eps": params['eps'],
-                "insider_eps": params['insider_eps'],
                 "outlet": outlet,
                 "pred_bm": float(pred[0]),
                 "pred_tgw": float(pred[1]),
@@ -236,16 +234,15 @@ def main():
     print("QUD-RSA: Semantics + Informativity + Cost")
     print("="*65)
 
-    for use_insider, name in [(False, "Without Register"), (True, "With Register")]:
-        avg_rmse, params = fit_model(use_insider=use_insider)
+    for use_register, name in [(False, "Without Register"), (True, "With Register")]:
+        avg_rmse, params = fit_model(use_register=use_register)
 
         print(f"\n{name}:")
-        print(f"  α={params['alpha']:.2f}, cost_w={params['cost_w']:.2f}, "
-              f"ε={params['eps']:.4f}, insider_ε={params['insider_eps']:.4f}")
+        print(f"  α={params['alpha']:.2f}, cost_w={params['cost_w']:.2f}")
         print(f"  Avg RMSE: {avg_rmse:.4f}")
 
         for outlet in ["Breitbart", "NPR", "PinkNews"]:
-            pred = predict(outlet, **params)
+            pred = predict(outlet, params['alpha'], params['cost_w'], use_register)
             obs = OBSERVED[outlet]
             r = rmse(pred, obs)
             print(f"    {outlet}: pred=[{pred[0]:.3f}, {pred[1]:.3f}, {pred[2]:.3f}] "

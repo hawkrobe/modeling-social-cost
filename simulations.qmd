@@ -57,8 +57,8 @@ ggsave("rmse_comparison.png", width = 6, height = 4, dpi = 150)
 #| label: tbl-params
 
 ablations |>
-  distinct(model, alpha, cost_w, eps, insider_eps) |>
-  rename(`α` = alpha, `Cost weight` = cost_w, `ε` = eps, `Insider ε` = insider_eps) |>
+  distinct(model, alpha, cost_w) |>
+  rename(`α` = alpha, `Cost weight` = cost_w) |>
   knitr::kable(digits = 4, caption = "Fitted parameters by model")
 ```
 
