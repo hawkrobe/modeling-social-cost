@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-QUD-RSA model for socially-indexed referring expressions.
+QUD-RSA model for socially-indexed referring expressions using memo.
 
 Three components:
   1. Semantics: who can say what (with register built in)
@@ -12,9 +12,9 @@ Usage:
     python rsa_ch2.py --ablations ablations.csv
 """
 
+from memo import memo
 import jax
 import jax.numpy as jnp
-from jax.nn import softmax
 import numpy as np
 from scipy.optimize import minimize
 import argparse
@@ -23,40 +23,20 @@ import csv
 jax.config.update("jax_enable_x64", True)
 
 # =============================================================================
-# DOMAINS & DATA
+# DOMAINS
 # =============================================================================
 
-PERSONAS = ["BB", "CJ", "BioMod", "TransMod", "TERF", "PN"]
-UTTERANCES = ["BM", "TGW", "TW"]
+P = jnp.arange(6)  # personas: BB, CJ, BioMod, TransMod, TERF, PN
+U = jnp.arange(3)  # utterances: BM, TGW, TW
+
+PERSONA_NAMES = ["BB", "CJ", "BioMod", "TransMod", "TERF", "PN"]
+UTT_NAMES = ["BM", "TGW", "TW"]
 
 OBSERVED = {
     "Breitbart": jnp.array([0.449, 0.408, 0.142]),
     "PinkNews":  jnp.array([0.000, 0.241, 0.759]),
     "NPR":       jnp.array([0.000, 0.687, 0.313]),
 }
-
-# =============================================================================
-# SEMANTICS
-# =============================================================================
-
-def soft_compat(eps, insider_eps):
-    """
-    Semantic compatibility with register built in.
-
-    - BM blocked for trans-affirming (eps)
-    - TW blocked for bioessentialist (eps)
-    - TW restricted for non-insider trans-affirming (insider_eps)
-    - TGW available to everyone
-    """
-    return jnp.array([
-        # BM   TGW   TW
-        [1,    1,    eps],         # BB (bio)
-        [eps,  1,    insider_eps], # CJ (trans, not insider)
-        [1,    1,    eps],         # BioMod (bio)
-        [eps,  1,    insider_eps], # TransMod (trans, not insider)
-        [1,    1,    eps],         # TERF (bio)
-        [eps,  1,    1],           # PN (trans, insider)
-    ], dtype=float)
 
 # =============================================================================
 # PRIORS
@@ -69,7 +49,7 @@ P_POL = {
 }
 P_BIO_GIVEN_POL = {"con": 0.85, "mod": 0.20, "prog": 0.05}
 
-def hier_prior(outlet):
+def make_prior(outlet):
     p, b = P_POL[outlet], P_BIO_GIVEN_POL
     prior = jnp.array([
         p["con"] * b["con"],         # BB
@@ -81,50 +61,79 @@ def hier_prior(outlet):
     ])
     return prior / prior.sum()
 
-PRIORS = {o: hier_prior(o) for o in OBSERVED}
+PRIORS = {o: make_prior(o) for o in OBSERVED}
 
 # =============================================================================
-# COSTS
-# =============================================================================
-
-COSTS = jnp.array([0.5, 0.6, 0.0])  # BM, TGW, TW (length-based)
-
-# =============================================================================
-# MODEL
+# SEMANTICS & COSTS
 # =============================================================================
 
 @jax.jit
-def predict_jit(prior, alpha, cost_w, eps, insider_eps):
+def compat(p, u, eps, insider_eps):
     """
-    RSA: speakers maximize being correctly identified.
+    Semantic compatibility: can persona p say utterance u?
 
-    U(u | persona) = α × log P(persona | u) - cost_w × cost(u)
+    - BM blocked for trans-affirming (eps)
+    - TW blocked for bioessentialist (eps)
+    - TW restricted for non-insider trans-affirming (insider_eps)
+    - TGW available to everyone
     """
-    compat = soft_compat(eps, insider_eps)
+    # Build compatibility matrix
+    mat = jnp.array([
+        # BM   TGW   TW
+        [1,    1,    eps],         # BB (bio)
+        [eps,  1,    insider_eps], # CJ (trans, not insider)
+        [1,    1,    eps],         # BioMod (bio)
+        [eps,  1,    insider_eps], # TransMod (trans, not insider)
+        [1,    1,    eps],         # TERF (bio)
+        [eps,  1,    1],           # PN (trans, insider)
+    ])
+    return mat[p, u]
 
-    # L0 posteriors: P(persona | utterance)
-    posteriors = prior[:, None] * compat
-    posteriors = posteriors / (posteriors.sum(axis=0, keepdims=True) + 1e-10)
+COSTS = jnp.array([0.5, 0.6, 0.0])  # BM, TGW, TW (length-based)
 
-    production = jnp.zeros(3)
+@jax.jit
+def cost(u):
+    return COSTS[u]
 
-    for p_idx in range(6):
-        # Informativity: log P(me | u)
-        info = jnp.log(posteriors[p_idx] + 1e-10)
+# =============================================================================
+# RSA MODEL (using memo)
+# =============================================================================
 
-        # Utility = informativity - cost
-        utilities = alpha * info - cost_w * COSTS
+@jax.jit
+def prior_wpp(p, prior):
+    return prior[p]
 
-        # S1 with semantic constraints
-        s1_logits = utilities + jnp.log(compat[p_idx] + 1e-10)
-        s1 = softmax(s1_logits)
+@memo
+def S1[p: P, u: U](alpha, cost_w, eps, insider_eps, prior: ...):
+    """S1 speaker: choose utterance to be correctly identified."""
+    speaker: knows(p)
+    speaker: thinks[
+        listener: thinks[
+            speaker: given(p in P, wpp=prior_wpp(p, prior)),
+            speaker: chooses(u in U, wpp=compat(p, u, eps, insider_eps))
+        ]
+    ]
+    speaker: chooses(u in U, wpp=exp(alpha * imagine[
+        listener: observes [speaker.u] is u,
+        listener: knows(p),
+        (
+            listener[ log(Pr[speaker.p == p]) ] -  # informativity
+            cost_w * cost(u)                        # cost
+        )
+    ]))
+    return Pr[speaker.u == u]
 
-        production = production + prior[p_idx] * s1
-
-    return production
+# =============================================================================
+# PREDICTION
+# =============================================================================
 
 def predict(outlet, alpha, cost_w, eps, insider_eps):
-    return np.array(predict_jit(PRIORS[outlet], alpha, cost_w, eps, insider_eps))
+    """Predict utterance distribution at an outlet."""
+    prior = PRIORS[outlet]
+    s1 = S1(alpha, cost_w, eps, insider_eps, prior=prior)
+    # Marginalize over personas
+    production = jnp.sum(prior[:, None] * s1, axis=0)
+    return np.array(production)
 
 def rmse(pred, obs):
     return float(np.sqrt(np.mean((np.array(pred) - np.array(obs))**2)))
@@ -143,7 +152,8 @@ def total_rmse(params):
 
 def fit_model(use_insider=True, n_starts=5):
     """Fit with scipy optimize."""
-    bounds = [(0.1, 20), (0, 20), (0.0001, 0.3), (0.0001, 1.0) if use_insider else (1.0, 1.0)]
+    bounds = [(0.1, 20), (0, 20), (0.0001, 0.3),
+              (0.0001, 1.0) if use_insider else (1.0, 1.0)]
 
     best_rmse = float('inf')
     best_x = None
@@ -174,7 +184,7 @@ def fit_model(use_insider=True, n_starts=5):
 # =============================================================================
 
 def run_ablations(outpath="ablations.csv"):
-    """Compare model with vs without register (insider_eps)."""
+    """Compare model with vs without register."""
     results = []
 
     for use_insider, name in [(False, "No Register"), (True, "With Register")]:
@@ -226,7 +236,6 @@ def main():
     print("QUD-RSA: Semantics + Informativity + Cost")
     print("="*65)
 
-    # Compare with vs without register
     for use_insider, name in [(False, "Without Register"), (True, "With Register")]:
         avg_rmse, params = fit_model(use_insider=use_insider)
 
