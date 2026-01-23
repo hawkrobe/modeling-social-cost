@@ -1,5 +1,5 @@
 ---
-title: "QUD-RSA Model with Register Dimension"
+title: "QUD-RSA Model Simulations"
 format:
   html:
     code-fold: true
@@ -20,11 +20,10 @@ theme_set(theme_minimal(base_size = 12))
 ```{r}
 #| label: run-model
 
-# Call Python model to generate ablations
 system("python rsa_ch2.py --ablations ablations.csv")
 
-# Read results
-ablations <- read_csv("ablations.csv", show_col_types = FALSE)
+ablations <- read_csv("ablations.csv", show_col_types = FALSE) |>
+  mutate(model = factor(model, levels = c("No Register", "With Register")))
 
 glimpse(ablations)
 ```
@@ -33,30 +32,23 @@ glimpse(ablations)
 
 ```{r}
 #| label: fig-rmse-comparison
-#| fig-cap: "Average RMSE by model variant"
-#| fig-height: 6
+#| fig-cap: "Register improves model fit"
+#| fig-height: 4
 
 rmse_summary <- ablations |>
-  group_by(model, bio, pol, reg, cost) |>
-  summarise(RMSE = mean(avg_rmse), .groups = "drop") |>
-  arrange(RMSE)
+  group_by(model) |>
+  summarise(RMSE = mean(avg_rmse), .groups = "drop")
 
-# Color by whether register is included
-rmse_summary <- rmse_summary |>
-  mutate(
-    n_mechanisms = (bio == "yes") + (pol == "yes") + (reg == "yes") + (cost == "yes"),
-    has_register = if_else(reg == "yes", "With Register", "Without Register")
-  )
+ggplot(rmse_summary, aes(x = model, y = RMSE, fill = model)) +
+  geom_col(alpha = 0.8, width = 0.6) +
+  geom_text(aes(label = round(RMSE, 3)), vjust = -0.5, size = 5) +
+  scale_fill_manual(values = c("No Register" = "#e74c3c", "With Register" = "#27ae60")) +
+  labs(x = NULL, y = "Average RMSE (lower = better)",
+       title = "Register dimension improves fit") +
+  theme(legend.position = "none") +
+  ylim(0, 0.16)
 
-ggplot(rmse_summary, aes(x = RMSE, y = reorder(model, -RMSE), fill = has_register)) +
-  geom_col(alpha = 0.8) +
-  scale_fill_manual(values = c("With Register" = "#27ae60", "Without Register" = "#95a5a6"),
-                    name = NULL) +
-  labs(x = "Average RMSE (lower = better)", y = NULL,
-       title = "Does Register Help Differentiate TW from TGW?") +
-  theme(legend.position = "bottom")
-
-ggsave("rmse_comparison.png", width = 10, height = 6, dpi = 150)
+ggsave("rmse_comparison.png", width = 6, height = 4, dpi = 150)
 ```
 
 ## Fitted Parameters
@@ -65,68 +57,23 @@ ggsave("rmse_comparison.png", width = 10, height = 6, dpi = 150)
 #| label: tbl-params
 
 ablations |>
-  distinct(model, alpha, bio_w, pol_w, reg_w, cost_w, epsilon) |>
-  arrange(desc(model == "Full"), model) |>
-  rename(`α` = alpha, `Bio` = bio_w, `Pol` = pol_w, `Reg` = reg_w, `Cost` = cost_w, `ε` = epsilon) |>
-  knitr::kable(digits = 2, caption = "Fitted parameters by model")
+  distinct(model, alpha, cost_w, eps, insider_eps) |>
+  rename(`α` = alpha, `Cost weight` = cost_w, `ε` = eps, `Insider ε` = insider_eps) |>
+  knitr::kable(digits = 4, caption = "Fitted parameters by model")
 ```
 
-## Register's Marginal Contribution
+## Predictions by Outlet
 
 ```{r}
-#| label: fig-marginal
-#| fig-cap: "Marginal contribution of register dimension"
-#| fig-height: 4
-
-# Compare models with vs without register
-rmse_lookup <- rmse_summary |>
-  select(model, RMSE) |>
-  deframe()
-
-marginal <- tibble(
-  comparison = c(
-    "Bio+Pol → +Reg",
-    "Bio+Cost → +Reg",
-    "Pol+Cost → +Reg",
-    "Bio+Pol+Cost → +Reg"
-  ),
-  baseline = c(
-    rmse_lookup["Bio+Pol"],
-    rmse_lookup["Bio+Cost"],
-    rmse_lookup["Pol+Cost"],
-    rmse_lookup["Bio+Pol+Cost"]
-  ),
-  with_reg = c(
-    rmse_lookup["Bio+Pol+Reg"],
-    rmse_lookup["Bio+Reg+Cost"],
-    rmse_lookup["Pol+Reg+Cost"],
-    rmse_lookup["Full"]
-  ),
-  improvement = baseline - with_reg
-)
-
-ggplot(marginal, aes(x = improvement, y = reorder(comparison, improvement))) +
-  geom_col(fill = "#27ae60", alpha = 0.8) +
-  geom_vline(xintercept = 0, linetype = "dashed") +
-  labs(x = "RMSE improvement from adding Register (positive = helps)", y = NULL,
-       title = "Register consistently improves fit") +
-  theme(axis.text.y = element_text(size = 11))
-
-ggsave("marginal_contributions.png", width = 8, height = 4, dpi = 150)
-```
-
-## Best Model Predictions
-
-```{r}
-#| label: fig-best-model
-#| fig-cap: "Observed vs predicted for best model (Full)"
-#| fig-height: 4
+#| label: fig-predictions
+#| fig-cap: "Observed vs predicted by outlet"
+#| fig-height: 5
 
 best_df <- ablations |>
-  filter(model == "Full")
+  filter(model == "With Register")
 
-best_long <- best_df |>
-  select(outlet, starts_with("pred_"), starts_with("obs_")) |>
+pred_long <- best_df |>
+  select(outlet, pred_bm, pred_tgw, pred_tw, obs_bm, obs_tgw, obs_tw) |>
   pivot_longer(-outlet, names_to = c("type", "utterance"), names_sep = "_") |>
   mutate(
     type = if_else(type == "pred", "Predicted", "Observed"),
@@ -139,37 +86,35 @@ rmse_labels <- best_df |>
   select(outlet, rmse) |>
   mutate(label = paste0("RMSE = ", round(rmse, 3)))
 
-ggplot(best_long, aes(x = utterance, y = value, fill = type)) +
+ggplot(pred_long, aes(x = utterance, y = value, fill = type)) +
   geom_col(position = "dodge", alpha = 0.8) +
   facet_wrap(~outlet) +
-  geom_text(data = rmse_labels, aes(x = 2, y = 0.95, label = label),
-            inherit.aes = FALSE, size = 3) +
+  geom_text(data = rmse_labels, aes(x = 2, y = 0.9, label = label),
+            inherit.aes = FALSE, size = 3.5) +
   scale_fill_manual(values = c("Observed" = "gray50", "Predicted" = "#27ae60")) +
   labs(x = NULL, y = "Proportion", fill = NULL,
-       title = "Full Model: Bio + Pol + Register + Cost") +
+       title = "Model with Register") +
   theme(legend.position = "bottom")
 
-ggsave("best_model_predictions.png", width = 10, height = 4, dpi = 150)
+ggsave("predictions.png", width = 10, height = 5, dpi = 150)
 ```
 
 ## With vs Without Register
 
 ```{r}
-#| label: fig-register-comparison
-#| fig-cap: "Effect of register dimension on TW/TGW differentiation"
+#| label: fig-register-effect
+#| fig-cap: "Effect of register on predictions"
 #| fig-height: 5
 
-# Compare Bio+Pol+Cost vs Full (with register)
 compare_df <- ablations |>
-  filter(model %in% c("Bio+Pol+Cost", "Full")) |>
   select(model, outlet, pred_bm, pred_tgw, pred_tw, obs_bm, obs_tgw, obs_tw) |>
   pivot_longer(cols = c(pred_bm:obs_tw),
                names_to = c("type", "utterance"),
                names_sep = "_") |>
   mutate(
     type = case_when(
-      type == "pred" & model == "Bio+Pol+Cost" ~ "Without Register",
-      type == "pred" & model == "Full" ~ "With Register",
+      type == "pred" & model == "No Register" ~ "No Register",
+      type == "pred" & model == "With Register" ~ "With Register",
       type == "obs" ~ "Observed"
     ),
     utterance = factor(utterance, levels = c("bm", "tgw", "tw"),
@@ -184,44 +129,11 @@ ggplot(compare_df, aes(x = utterance, y = value, fill = type)) +
   facet_wrap(~outlet) +
   scale_fill_manual(values = c("Observed" = "gray30",
                                 "With Register" = "#27ae60",
-                                "Without Register" = "#e74c3c")) +
+                                "No Register" = "#e74c3c")) +
   labs(x = NULL, y = "Proportion", fill = NULL,
        title = "Register helps capture TW preference at PinkNews") +
   theme(legend.position = "bottom")
 
-ggsave("register_comparison.png", width = 10, height = 5, dpi = 150)
-```
-
-## Key Findings
-
-```{r}
-#| label: key-findings
-
-cat("KEY FINDINGS\n")
-cat(strrep("=", 60), "\n\n")
-
-# Best model
-best <- rmse_summary |> slice_min(RMSE, n = 1)
-cat("Best model:", as.character(best$model), "\n")
-cat("  Average RMSE:", round(best$RMSE, 4), "\n\n")
-
-# Register's contribution
-cat("Register's marginal contribution:\n")
-for (i in 1:nrow(marginal)) {
-  sign <- if_else(marginal$improvement[i] > 0, "+", "")
-  cat("  ", marginal$comparison[i], ": ", sign, round(marginal$improvement[i], 4), "\n")
-}
-
-# Outlet fit
-cat("\nFit by outlet (Full model):\n")
-best_df |>
-  select(outlet, rmse) |>
-  mutate(quality = case_when(
-    rmse < 0.05 ~ "excellent",
-    rmse < 0.10 ~ "good",
-    rmse < 0.15 ~ "moderate",
-    TRUE ~ "poor"
-  )) |>
-  knitr::kable(digits = 4)
+ggsave("register_effect.png", width = 10, height = 5, dpi = 150)
 ```
 
