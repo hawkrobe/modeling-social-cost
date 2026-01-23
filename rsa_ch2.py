@@ -110,7 +110,7 @@ P_POL = {
     "PinkNews":  {"con": 0.02, "mod": 0.18, "prog": 0.80},
     "NPR":       {"con": 0.15, "mod": 0.55, "prog": 0.30},
 }
-P_BIO_GIVEN_POL = {"con": 0.85, "mod": 0.40, "prog": 0.15}
+P_BIO_GIVEN_POL = {"con": 0.85, "mod": 0.20, "prog": 0.05}
 
 def hier_prior(outlet):
     """P(persona) = P(pol|outlet) × P(bio|pol)"""
@@ -227,35 +227,47 @@ def total_rmse(params):
 # FITTING
 # =============================================================================
 
-def fit_model(use_bio=True, use_pol=True, use_reg=True, use_cost=True):
-    """Fast grid search with coarse grid."""
+def fit_model(use_bio=True, use_pol=True, use_reg=True, use_cost=True, n_starts=5):
+    """Pure scipy optimize with multiple random starts."""
+    from scipy.optimize import minimize
+
+    def objective(x):
+        return total_rmse(tuple(x))
+
+    bounds = [(0.1, 20), (0, 50), (0, 50), (0, 50), (0, 50), (0.0001, 0.2)]
+    if not use_bio: bounds[1] = (0, 0)
+    if not use_pol: bounds[2] = (0, 0)
+    if not use_reg: bounds[3] = (0, 0)
+    if not use_cost: bounds[4] = (0, 0)
+
     best_rmse = float('inf')
-    best_params = {}
+    best_x = None
 
-    # Coarse grid - just a few values each
-    alphas = [2.0, 4.0]
-    weights = [0.0, 1.0, 2.0, 3.0]
-    epsilons = [0.01, 0.05]
+    # Multiple starting points
+    np.random.seed(42)
+    for _ in range(n_starts):
+        x0 = [
+            np.random.uniform(1, 5),      # alpha
+            np.random.uniform(0, 5) if use_bio else 0,
+            np.random.uniform(0, 5) if use_pol else 0,
+            np.random.uniform(0, 5) if use_reg else 0,
+            np.random.uniform(0, 5) if use_cost else 0,
+            np.random.uniform(0.001, 0.1)  # eps
+        ]
+        result = minimize(objective, x0, method='L-BFGS-B', bounds=bounds,
+                         options={'maxiter': 200})
+        if result.fun < best_rmse:
+            best_rmse = result.fun
+            best_x = result.x
 
-    for alpha in alphas:
-        for bio_w in (weights if use_bio else [0.0]):
-            for pol_w in (weights if use_pol else [0.0]):
-                for reg_w in (weights if use_reg else [0.0]):
-                    for cost_w in (weights if use_cost else [0.0]):
-                        for eps in epsilons:
-                            avg = total_rmse((alpha, bio_w, pol_w, reg_w, cost_w, eps))
-                            if avg < best_rmse:
-                                best_rmse = avg
-                                best_params = {
-                                    'alpha': alpha,
-                                    'bio_w': bio_w,
-                                    'pol_w': pol_w,
-                                    'reg_w': reg_w,
-                                    'cost_w': cost_w,
-                                    'eps': eps
-                                }
-
-    return best_rmse, best_params
+    return best_rmse, {
+        'alpha': best_x[0],
+        'bio_w': best_x[1],
+        'pol_w': best_x[2],
+        'reg_w': best_x[3],
+        'cost_w': best_x[4],
+        'eps': best_x[5]
+    }
 
 # =============================================================================
 # ANALYSIS FUNCTIONS
