@@ -1,5 +1,5 @@
 ---
-title: "RSA Model Simulations"
+title: "QUD-RSA Model Simulations"
 format:
   html:
     code-fold: true
@@ -7,283 +7,133 @@ format:
     fig-height: 6
 ---
 
-```{python}
+```{r}
 #| label: setup
 #| message: false
 
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-sns.set_theme(style="whitegrid")
+library(tidyverse)
+theme_set(theme_minimal(base_size = 12))
 ```
 
-## Data
+## Generate Predictions
 
-```{python}
-#| label: data
+```{r}
+#| label: run-model
 
-raw_counts = {
-    "Breitbart": {"biological male": 331, "transgender woman": 301, "trans woman": 105},
-    "NPR": {"biological male": 0, "transgender woman": 200, "trans woman": 91},
-    "PinkNews": {"biological male": 0, "transgender woman": 1900, "trans woman": 5978},
-}
+system("python rsa_ch2.py --ablations ablations.csv")
 
-observed = {}
-for outlet, counts in raw_counts.items():
-    total = sum(counts.values())
-    observed[outlet] = {k: v/total for k, v in counts.items()}
+ablations <- read_csv("ablations.csv", show_col_types = FALSE) |>
+  mutate(model = factor(model, levels = c("No Register", "With Register")))
 
-UTTERANCES = ["biological male", "transgender woman", "trans woman"]
-PERSONAE = ["BB", "CJ", "BioMod", "TransMod", "TERF", "PN"]
-OUTLETS = ["Breitbart", "NPR", "PinkNews"]
-```
-
-## Model Components
-
-```{python}
-#| label: model-components
-
-# Semantic compatibility: who can use what
-# "biological male" → conservative OR bioessentialist
-# "trans woman" → trans-affirming only
-# "transgender woman" → anyone
-COMPAT = np.array([
-    [1, 1, 0],  # BB
-    [1, 1, 1],  # CJ
-    [1, 1, 0],  # BioMod
-    [0, 1, 1],  # TransMod
-    [1, 1, 0],  # TERF
-    [0, 1, 1],  # PN
-], dtype=float)
-
-# No semantics (anyone can use anything)
-NO_COMPAT = np.ones((6, 3), dtype=float)
-
-# Uniform priors
-UNIFORM_PRIOR = np.ones(6) / 6
-
-# Flat priors (hand-specified per outlet)
-def normalize(x): return x / x.sum()
-FLAT_PRIORS = {
-    "Breitbart": normalize(np.array([.60, .15, .13, .10, .01, .01])),
-    "PinkNews":  normalize(np.array([.01, .01, .10, .25, .13, .60])),
-    "NPR":       normalize(np.array([.10, .10, .15, .45, .15, .15])),
-}
-
-# Hierarchical priors: P(persona) = P(pol) × P(bio|pol)
-P_POL = {
-    "Breitbart": {"con": .75, "mod": .20, "prog": .05},
-    "PinkNews":  {"con": .02, "mod": .18, "prog": .80},
-    "NPR":       {"con": .15, "mod": .55, "prog": .30},
-}
-P_BIO_GIVEN_POL = {"con": .85, "mod": .40, "prog": .15}
-
-def hier_prior(outlet):
-    p, b = P_POL[outlet], P_BIO_GIVEN_POL
-    prior = np.array([
-        p["con"]*b["con"], p["con"]*(1-b["con"]),
-        p["mod"]*b["mod"], p["mod"]*(1-b["mod"]),
-        p["prog"]*b["prog"], p["prog"]*(1-b["prog"]),
-    ])
-    return prior / prior.sum()
-
-HIER_PRIORS = {o: hier_prior(o) for o in OUTLETS}
-
-# Costs
-COST_ZERO = np.zeros(3)
-COST_GENERAL = np.array([-12.05, -14.62, -14.85])
-COST_OUTLET = {
-    "Breitbart": np.array([-16., -14., -12.]),
-    "PinkNews":  np.array([-10., -14., -17.]),
-    "NPR":       np.array([-11., -16., -14.]),
-}
-```
-
-## RSA Model
-
-```{python}
-#| label: rsa-model
-
-ALPHA = 1.0
-
-def L0(prior, compat):
-    """Literal listener: P(persona | utterance)"""
-    L0_dist = np.zeros((3, 6))
-    for u in range(3):
-        weights = prior * compat[:, u]
-        if weights.sum() > 0:
-            L0_dist[u] = weights / weights.sum()
-        else:
-            L0_dist[u] = np.ones(6) / 6
-    return L0_dist
-
-def S1(prior, costs, compat, social_w=0.5, cost_w=0.5):
-    """Pragmatic speaker: P(utterance | persona)"""
-    L0_dist = L0(prior, compat)
-    S1_dist = np.zeros((6, 3))
-    for p in range(6):
-        weights = np.zeros(3)
-        for u in range(3):
-            if compat[p, u] > 0:
-                info = np.log(L0_dist[u, p] + 1e-10)
-                util = social_w * info - cost_w * costs[u]
-                weights[u] = np.exp(ALPHA * util)
-        if weights.sum() > 0:
-            S1_dist[p] = weights / weights.sum()
-    return S1_dist
-
-def production(prior, costs, compat, social_w=0.5, cost_w=0.5):
-    """Expected production: P(utt) = Σ_p P(p) × S1(utt|p)"""
-    S1_dist = S1(prior, costs, compat, social_w, cost_w)
-    return prior @ S1_dist
-
-def run_model(prior, costs, compat=COMPAT, social_w=0.5, cost_w=0.5):
-    pred = production(prior, costs, compat, social_w, cost_w)
-    return {UTTERANCES[i]: pred[i] for i in range(3)}
-
-def rmse(pred, obs):
-    return np.sqrt(np.mean([(pred[u] - obs[u])**2 for u in UTTERANCES]))
+glimpse(ablations)
 ```
 
 ## Model Comparison
 
-```{python}
-#| label: run-ablations
+```{r}
+#| label: fig-rmse-comparison
+#| fig-cap: "Register improves model fit"
+#| fig-height: 4
 
-# Define all model variants
-models = {
-    # Baseline ablations
-    "Uniform + No cost": lambda o: run_model(UNIFORM_PRIOR, COST_ZERO),
-    "Uniform + General cost": lambda o: run_model(UNIFORM_PRIOR, COST_GENERAL),
-    "Uniform + Outlet cost": lambda o: run_model(UNIFORM_PRIOR, COST_OUTLET[o]),
+rmse_summary <- ablations |>
+  group_by(model) |>
+  summarise(RMSE = mean(avg_rmse), .groups = "drop")
 
-    # Flat prior variants
-    "Flat + No cost": lambda o: run_model(FLAT_PRIORS[o], COST_ZERO),
-    "Flat + General cost": lambda o: run_model(FLAT_PRIORS[o], COST_GENERAL),
-    "Flat + Outlet cost": lambda o: run_model(FLAT_PRIORS[o], COST_OUTLET[o]),
+ggplot(rmse_summary, aes(x = model, y = RMSE, fill = model)) +
+  geom_col(alpha = 0.8, width = 0.6) +
+  geom_text(aes(label = round(RMSE, 3)), vjust = -0.5, size = 5) +
+  scale_fill_manual(values = c("No Register" = "#e74c3c", "With Register" = "#27ae60")) +
+  labs(x = NULL, y = "Average RMSE (lower = better)",
+       title = "Register dimension improves fit") +
+  theme(legend.position = "none") +
+  ylim(0, 0.16)
 
-    # Hierarchical prior variants
-    "Hier + No cost": lambda o: run_model(HIER_PRIORS[o], COST_ZERO),
-    "Hier + General cost": lambda o: run_model(HIER_PRIORS[o], COST_GENERAL),
-    "Hier + Outlet cost": lambda o: run_model(HIER_PRIORS[o], COST_OUTLET[o]),
-
-    # No semantics
-    "No semantics": lambda o: run_model(HIER_PRIORS[o], COST_OUTLET[o], compat=NO_COMPAT),
-
-    # Only informativity / only cost
-    "Only informativity": lambda o: run_model(HIER_PRIORS[o], COST_OUTLET[o], social_w=1.0, cost_w=0.0),
-    "Only cost": lambda o: run_model(HIER_PRIORS[o], COST_OUTLET[o], social_w=0.0, cost_w=1.0),
-}
-
-# Run all models
-results = []
-for model_name, model_fn in models.items():
-    for outlet in OUTLETS:
-        pred = model_fn(outlet)
-        obs = observed[outlet]
-        r = rmse(pred, obs)
-        results.append({
-            "Model": model_name,
-            "Outlet": outlet,
-            "RMSE": r,
-            **{f"pred_{u}": pred[u] for u in UTTERANCES},
-            **{f"obs_{u}": obs[u] for u in UTTERANCES},
-        })
-
-df = pd.DataFrame(results)
-rmse_df = df.groupby("Model")["RMSE"].mean().sort_values()
+ggsave("rmse_comparison.png", width = 6, height = 4, dpi = 150)
 ```
 
-### RMSE by Model Variant
+## Fitted Parameters
 
-```{python}
-#| label: fig-rmse
-#| fig-cap: "Average RMSE across outlets for each model variant"
+```{r}
+#| label: tbl-params
 
-fig, ax = plt.subplots(figsize=(10, 6))
-
-colors = []
-for m in rmse_df.index:
-    if "Hier + Outlet" in m:
-        colors.append("#2ecc71")  # best model - green
-    elif "Outlet" in m:
-        colors.append("#3498db")  # outlet cost - blue
-    elif "Hier" in m:
-        colors.append("#9b59b6")  # hierarchical - purple
-    elif "Uniform" in m or "No semantics" in m or "Only" in m:
-        colors.append("#95a5a6")  # ablations - gray
-    else:
-        colors.append("#e74c3c")  # flat - red
-
-ax.barh(range(len(rmse_df)), rmse_df.values, color=colors, alpha=0.8)
-ax.set_yticks(range(len(rmse_df)))
-ax.set_yticklabels(rmse_df.index)
-ax.set_xlabel("Average RMSE")
-ax.axvline(rmse_df["Hier + Outlet cost"], color="#2ecc71", linestyle="--", alpha=0.5)
-
-plt.tight_layout()
-plt.savefig("rmse_comparison.png", dpi=150, bbox_inches="tight")
-plt.show()
+ablations |>
+  distinct(model, alpha, cost_w) |>
+  rename(`α` = alpha, `Cost weight` = cost_w) |>
+  knitr::kable(digits = 4, caption = "Fitted parameters by model")
 ```
 
-### Best Model Predictions
+## Predictions by Outlet
 
-```{python}
-#| label: fig-best-model
-#| fig-cap: "Observed vs predicted for best model (Hierarchical + Outlet cost)"
+```{r}
+#| label: fig-predictions
+#| fig-cap: "Observed vs predicted by outlet"
+#| fig-height: 5
 
-best_df = df[df["Model"] == "Hier + Outlet cost"].copy()
+best_df <- ablations |>
+  filter(model == "With Register")
 
-fig, axes = plt.subplots(1, 3, figsize=(12, 4), sharey=True)
-colors = {"biological male": "#e74c3c", "transgender woman": "#3498db", "trans woman": "#2ecc71"}
+pred_long <- best_df |>
+  select(outlet, pred_bm, pred_tgw, pred_tw, obs_bm, obs_tgw, obs_tw) |>
+  pivot_longer(-outlet, names_to = c("type", "utterance"), names_sep = "_") |>
+  mutate(
+    type = if_else(type == "pred", "Predicted", "Observed"),
+    utterance = factor(utterance, levels = c("bm", "tgw", "tw"),
+                      labels = c("BM", "TGW", "TW")),
+    outlet = factor(outlet, levels = c("Breitbart", "NPR", "PinkNews"))
+  )
 
-for ax, outlet in zip(axes, OUTLETS):
-    outlet_row = best_df[best_df["Outlet"] == outlet].iloc[0]
+rmse_labels <- best_df |>
+  select(outlet, rmse) |>
+  mutate(label = paste0("RMSE = ", round(rmse, 3)))
 
-    x = np.arange(3)
-    width = 0.35
+ggplot(pred_long, aes(x = utterance, y = value, fill = type)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  facet_wrap(~outlet) +
+  geom_text(data = rmse_labels, aes(x = 2, y = 0.9, label = label),
+            inherit.aes = FALSE, size = 3.5) +
+  scale_fill_manual(values = c("Observed" = "gray50", "Predicted" = "#27ae60")) +
+  labs(x = NULL, y = "Proportion", fill = NULL,
+       title = "Model with Register") +
+  theme(legend.position = "bottom")
 
-    obs_vals = [outlet_row[f"obs_{u}"] for u in UTTERANCES]
-    pred_vals = [outlet_row[f"pred_{u}"] for u in UTTERANCES]
-
-    ax.bar(x - width/2, obs_vals, width, label="Observed", color="gray", alpha=0.7)
-    ax.bar(x + width/2, pred_vals, width, label="Predicted",
-           color=[colors[u] for u in UTTERANCES], alpha=0.8)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(["BM", "TGW", "TW"])
-    ax.set_title(f"{outlet}\n(RMSE = {outlet_row['RMSE']:.3f})")
-    ax.set_ylim(0, 1)
-
-axes[0].set_ylabel("Proportion")
-axes[0].legend()
-plt.tight_layout()
-plt.savefig("best_model_predictions.png", dpi=150, bbox_inches="tight")
-plt.show()
+ggsave("predictions.png", width = 10, height = 5, dpi = 150)
 ```
 
-### RMSE by Outlet
+## With vs Without Register
 
-```{python}
-#| label: fig-rmse-by-outlet
-#| fig-cap: "RMSE by outlet for key model variants"
+```{r}
+#| label: fig-register-effect
+#| fig-cap: "Effect of register on predictions"
+#| fig-height: 5
 
-key_models = ["Uniform + No cost", "Flat + General cost", "Flat + Outlet cost",
-              "Hier + General cost", "Hier + Outlet cost"]
-key_df = df[df["Model"].isin(key_models)]
+compare_df <- ablations |>
+  select(model, outlet, pred_bm, pred_tgw, pred_tw, obs_bm, obs_tgw, obs_tw) |>
+  pivot_longer(cols = c(pred_bm:obs_tw),
+               names_to = c("type", "utterance"),
+               names_sep = "_") |>
+  mutate(
+    type = case_when(
+      type == "pred" & model == "No Register" ~ "No Register",
+      type == "pred" & model == "With Register" ~ "With Register",
+      type == "obs" ~ "Observed"
+    ),
+    utterance = factor(utterance, levels = c("bm", "tgw", "tw"),
+                      labels = c("BM", "TGW", "TW")),
+    outlet = factor(outlet, levels = c("Breitbart", "NPR", "PinkNews"))
+  ) |>
+  filter(!is.na(type)) |>
+  distinct()
 
-fig, ax = plt.subplots(figsize=(10, 5))
-pivot = key_df.pivot(index="Model", columns="Outlet", values="RMSE")
-pivot = pivot.reindex(key_models)
+ggplot(compare_df, aes(x = utterance, y = value, fill = type)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  facet_wrap(~outlet) +
+  scale_fill_manual(values = c("Observed" = "gray30",
+                                "With Register" = "#27ae60",
+                                "No Register" = "#e74c3c")) +
+  labs(x = NULL, y = "Proportion", fill = NULL,
+       title = "Register helps capture TW preference at PinkNews") +
+  theme(legend.position = "bottom")
 
-pivot.plot(kind="bar", ax=ax, alpha=0.8)
-ax.set_ylabel("RMSE")
-ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
-ax.legend(title="Outlet")
-
-plt.tight_layout()
-plt.savefig("rmse_by_outlet.png", dpi=150, bbox_inches="tight")
-plt.show()
+ggsave("register_effect.png", width = 10, height = 5, dpi = 150)
 ```
+

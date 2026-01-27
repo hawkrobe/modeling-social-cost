@@ -1,38 +1,36 @@
 #!/usr/bin/env python3
 """
-Dual-pathway RSA model for socially-indexed referring expressions.
+QUD-RSA model for socially-indexed referring expressions using memo.
+
+Three components:
+  1. Semantics: who can say what (with register built in)
+  2. Informativity: speakers want to be correctly identified
+  3. Costs: length-based
 
 Usage:
-    python rsa_ch2.py --compare     # Compare model variants
-    python rsa_ch2.py               # Run full model on all outlets
-
-Requirements: pip install memo-lang jax jaxlib
+    python rsa_ch2.py
+    python rsa_ch2.py --ablations ablations.csv
 """
 
 from memo import memo
-from enum import IntEnum
 import jax
 import jax.numpy as jnp
+import numpy as np
+from scipy.optimize import minimize
 import argparse
+import csv
+
+jax.config.update("jax_enable_x64", True)
 
 # =============================================================================
-# DOMAINS & DATA
+# DOMAINS
 # =============================================================================
 
-class Persona(IntEnum):
-    BB = 0        # Conservative + Bioessentialist
-    CJ = 1        # Conservative + Trans-affirming
-    BIO_MOD = 2   # Moderate + Bioessentialist
-    TRANS_MOD = 3 # Moderate + Trans-affirming
-    TERF = 4      # Progressive + Bioessentialist
-    PN = 5        # Progressive + Trans-affirming
+P = jnp.arange(6)  # personas: BB, CJ, BioMod, TransMod, TERF, PN
+U = jnp.arange(3)  # utterances: BM, TGW, TW
 
-class Utterance(IntEnum):
-    BIO_MALE = 0  # "biological male"
-    TG_WOMAN = 1  # "transgender woman"
-    TRANS_W = 2   # "trans woman"
-
-UTT_NAMES = ["biological male", "transgender woman", "trans woman"]
+PERSONA_NAMES = ["BB", "CJ", "BioMod", "TransMod", "TERF", "PN"]
+UTT_NAMES = ["BM", "TGW", "TW"]
 
 OBSERVED = {
     "Breitbart": jnp.array([0.449, 0.408, 0.142]),
@@ -40,153 +38,216 @@ OBSERVED = {
     "NPR":       jnp.array([0.000, 0.687, 0.313]),
 }
 
-# Semantic compatibility: who can use what
-# "biological male" → conservative OR bioessentialist
-# "trans woman" → trans-affirming (not bioessentialist)
-# "transgender woman" → anyone
-COMPAT = jnp.array([
-    [1, 1, 0], [1, 1, 1], [1, 1, 0],  # BB, CJ, BioMod
-    [0, 1, 1], [1, 1, 0], [0, 1, 1],  # TransMod, TERF, PN
-], dtype=float)
-
 # =============================================================================
 # PRIORS
 # =============================================================================
 
-# Flat priors: 6 independent parameters per outlet (hand-specified)
-def normalize(x): return x / x.sum()
-FLAT_PRIORS = {
-    "Breitbart": normalize(jnp.array([.60, .15, .13, .10, .01, .01])),
-    "PinkNews":  normalize(jnp.array([.01, .01, .10, .25, .13, .60])),
-    "NPR":       normalize(jnp.array([.10, .10, .15, .45, .15, .15])),
-}
-
-# Hierarchical: P(persona) = P(pol) × P(bio|pol)
 P_POL = {
-    "Breitbart": {"con": .75, "mod": .20, "prog": .05},
-    "PinkNews":  {"con": .02, "mod": .18, "prog": .80},
-    "NPR":       {"con": .15, "mod": .55, "prog": .30},
+    "Breitbart": {"con": 0.75, "mod": 0.20, "prog": 0.05},
+    "PinkNews":  {"con": 0.02, "mod": 0.18, "prog": 0.80},
+    "NPR":       {"con": 0.15, "mod": 0.55, "prog": 0.30},
 }
-P_BIO_GIVEN_POL = {"con": .85, "mod": .40, "prog": .15}
+P_BIO_GIVEN_POL = {"con": 0.85, "mod": 0.20, "prog": 0.05}
 
-def hier_prior(outlet):
+def make_prior(outlet):
     p, b = P_POL[outlet], P_BIO_GIVEN_POL
     prior = jnp.array([
-        p["con"]*b["con"], p["con"]*(1-b["con"]),
-        p["mod"]*b["mod"], p["mod"]*(1-b["mod"]),
-        p["prog"]*b["prog"], p["prog"]*(1-b["prog"]),
+        p["con"] * b["con"],         # BB
+        p["con"] * (1 - b["con"]),   # CJ
+        p["mod"] * b["mod"],         # BioMod
+        p["mod"] * (1 - b["mod"]),   # TransMod
+        p["prog"] * b["prog"],       # TERF
+        p["prog"] * (1 - b["prog"]), # PN
     ])
     return prior / prior.sum()
 
-HIER_PRIORS = {o: hier_prior(o) for o in OBSERVED}
+PRIORS = {o: make_prior(o) for o in OBSERVED}
 
 # =============================================================================
-# COSTS (more negative = more accessible)
+# SEMANTICS & COSTS
 # =============================================================================
 
-COST_GENERAL = jnp.array([-12.05, -14.62, -14.85])
-COST_OUTLET = {
-    "Breitbart": jnp.array([-16., -14., -12.]),  # BM accessible
-    "PinkNews":  jnp.array([-10., -14., -17.]),  # TW accessible
-    "NPR":       jnp.array([-11., -16., -14.]),  # TGW accessible
-}
+# Semantic constraints (who can say what)
+# Using small epsilon for numerical stability
+EPS = 0.001
 
-# =============================================================================
-# MODEL
-# =============================================================================
+# With register: TW only available to insider (PN)
+COMPAT_REGISTER = jnp.array([
+    # BM   TGW   TW
+    [1,    1,    EPS],  # BB (bio)
+    [EPS,  1,    EPS],  # CJ (trans, not insider)
+    [1,    1,    EPS],  # BioMod (bio)
+    [EPS,  1,    EPS],  # TransMod (trans, not insider)
+    [1,    1,    EPS],  # TERF (bio)
+    [EPS,  1,    1],    # PN (trans, insider)
+], dtype=float)
 
-ALPHA, SOCIAL_W, COST_W = 1.0, 0.5, 0.5
+# Without register: TW available to all trans-affirming
+COMPAT_NO_REGISTER = jnp.array([
+    # BM   TGW   TW
+    [1,    1,    EPS],  # BB (bio)
+    [EPS,  1,    1],    # CJ (trans)
+    [1,    1,    EPS],  # BioMod (bio)
+    [EPS,  1,    1],    # TransMod (trans)
+    [1,    1,    EPS],  # TERF (bio)
+    [EPS,  1,    1],    # PN (trans)
+], dtype=float)
 
 @jax.jit
-def idx(arr, i): return arr[i]
+def compat(p, u, use_register):
+    """Semantic compatibility with hard constraints."""
+    mat = jnp.where(use_register, COMPAT_REGISTER, COMPAT_NO_REGISTER)
+    return mat[p, u]
+
+COSTS = jnp.array([0.5, 0.6, 0.0])  # BM, TGW, TW (length-based)
 
 @jax.jit
-def idx2(arr, i, j): return arr[i, j]
+def cost(u):
+    return COSTS[u]
+
+# =============================================================================
+# RSA MODEL (using memo)
+# =============================================================================
+
+@jax.jit
+def prior_wpp(p, prior):
+    return prior[p]
 
 @memo
-def S1[p: Persona, u: Utterance](alpha, social_w, cost_w, prior: ..., costs: ..., compat: ...):
-    """
-    Pragmatic speaker: P(utterance | persona)
-
-    Speaker knows their persona and chooses utterance to maximize:
-      U(u,p) = social_w × log L0(p|u) - cost_w × cost(u)
-    """
+def S1[p: P, u: U](alpha, cost_w, use_register, prior: ...):
+    """S1 speaker: choose utterance to be correctly identified."""
     speaker: knows(p)
     speaker: thinks[
-        # Speaker models literal listener
         listener: thinks[
-            spk: chooses(pers in Persona, wpp=idx(prior, pers)),
-            spk: chooses(utt in Utterance, wpp=idx2(compat, pers, utt))
+            speaker: given(p in P, wpp=prior_wpp(p, prior)),
+            speaker: chooses(u in U, wpp=compat(p, u, use_register))
         ]
     ]
-    speaker: chooses(utt in Utterance, wpp=idx2(compat, p, utt) * exp(alpha * imagine[
-        listener: observes [spk.utt] is utt,
+    speaker: chooses(u in U, wpp=exp(alpha * imagine[
+        listener: observes [speaker.u] is u,
         listener: knows(p),
         (
-            social_w * listener[ log(Pr[spk.pers == p] + 1e-10) ] -  # Informativity
-            cost_w * idx(costs, utt)                                  # Cost
+            listener[ log(Pr[speaker.p == p]) ] -  # informativity
+            cost_w * cost(u)                        # cost
         )
     ]))
-    return Pr[speaker.utt == u]
+    return Pr[speaker.u == u]
 
-@memo
-def production[u_query: Utterance](alpha, social_w, cost_w, prior: ..., costs: ..., compat: ...):
-    """Expected production: P(utt) = Σ_p P(p) × S1(utt|p)"""
-    world: chooses(pers in Persona, wpp=idx(prior, pers))
-    world: chooses(utt in Utterance, wpp=S1[pers, utt](alpha, social_w, cost_w, prior, costs, compat))
-    return Pr[world.utt == u_query]
+# =============================================================================
+# PREDICTION
+# =============================================================================
 
-def run(prior, costs):
-    """Compute production distribution"""
-    return production(ALPHA, SOCIAL_W, COST_W, prior, costs, COMPAT)
+def predict(outlet, alpha, cost_w, use_register):
+    """Predict utterance distribution at an outlet."""
+    prior = PRIORS[outlet]
+    s1 = S1(alpha, cost_w, float(use_register), prior=prior)
+    # Marginalize over personas
+    production = jnp.sum(prior[:, None] * s1, axis=0)
+    return np.array(production)
 
 def rmse(pred, obs):
-    return float(jnp.sqrt(jnp.mean((pred - obs)**2)))
+    return float(np.sqrt(np.mean((np.array(pred) - np.array(obs))**2)))
+
+def total_rmse(params, use_register):
+    alpha, cost_w = params
+    total = 0
+    for outlet in OBSERVED:
+        pred = predict(outlet, alpha, cost_w, use_register)
+        total += rmse(pred, OBSERVED[outlet])
+    return total / len(OBSERVED)
+
+# =============================================================================
+# FITTING
+# =============================================================================
+
+def fit_model(use_register=True, n_starts=5):
+    """Fit alpha and cost_w with scipy optimize."""
+    bounds = [(0.1, 20), (0, 20)]
+
+    best_rmse = float('inf')
+    best_x = None
+
+    np.random.seed(42)
+    for _ in range(n_starts):
+        x0 = [np.random.uniform(1, 5), np.random.uniform(0, 5)]
+        result = minimize(total_rmse, x0, args=(use_register,),
+                         method='L-BFGS-B', bounds=bounds,
+                         options={'maxiter': 200})
+        if result.fun < best_rmse:
+            best_rmse = result.fun
+            best_x = result.x
+
+    return best_rmse, {'alpha': best_x[0], 'cost_w': best_x[1]}
+
+# =============================================================================
+# ABLATIONS
+# =============================================================================
+
+def run_ablations(outpath="ablations.csv"):
+    """Compare model with vs without register."""
+    results = []
+
+    for use_register, name in [(False, "No Register"), (True, "With Register")]:
+        avg_rmse, params = fit_model(use_register=use_register)
+
+        for outlet in OBSERVED:
+            pred = predict(outlet, params['alpha'], params['cost_w'], use_register)
+            obs = OBSERVED[outlet]
+            r = rmse(pred, obs)
+
+            results.append({
+                "model": name,
+                "alpha": params['alpha'],
+                "cost_w": params['cost_w'],
+                "outlet": outlet,
+                "pred_bm": float(pred[0]),
+                "pred_tgw": float(pred[1]),
+                "pred_tw": float(pred[2]),
+                "obs_bm": float(obs[0]),
+                "obs_tgw": float(obs[1]),
+                "obs_tw": float(obs[2]),
+                "rmse": r,
+                "avg_rmse": avg_rmse,
+            })
+
+    with open(outpath, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=results[0].keys())
+        writer.writeheader()
+        writer.writerows(results)
+
+    print(f"Saved {len(results)} rows to {outpath}")
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
-def compare():
-    print("\nMODEL COMPARISON (RMSE)\n" + "-"*70)
-    print(f"{'Model':<20} {'Breitbart':>12} {'PinkNews':>12} {'NPR':>12} {'Avg':>10}")
-    print("-"*70)
-
-    results = {}
-    for ptype, priors in [("Flat", FLAT_PRIORS), ("Hier", HIER_PRIORS)]:
-        for ctype, cfn in [("General", lambda o: COST_GENERAL), ("Outlet", lambda o: COST_OUTLET[o])]:
-            name = f"{ptype} + {ctype}"
-            rs = {o: rmse(run(priors[o], cfn(o)), OBSERVED[o]) for o in OBSERVED}
-            results[name] = rs
-            print(f"{name:<20} {rs['Breitbart']:>12.4f} {rs['PinkNews']:>12.4f} {rs['NPR']:>12.4f} {sum(rs.values())/3:>10.4f}")
-
-    b = sum(results["Flat + General"].values())/3
-    print(f"\nBaseline: {b:.4f}")
-    print(f"  + Outlet costs:      Δ = {b - sum(results['Flat + Outlet'].values())/3:+.4f}")
-    print(f"  + Hier priors:       Δ = {b - sum(results['Hier + General'].values())/3:+.4f}")
-    print(f"  + Both:              Δ = {b - sum(results['Hier + Outlet'].values())/3:+.4f}")
-
 def main():
-    parser = argparse.ArgumentParser(description="RSA Model for Trans REs")
-    parser.add_argument("--compare", action="store_true")
-    parser.add_argument("--outlet", choices=["Breitbart", "PinkNews", "NPR"])
-    parser.add_argument("--prior", choices=["flat", "hier"], default="hier")
-    parser.add_argument("--cost", choices=["general", "outlet"], default="outlet")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ablations", type=str, nargs="?", const="ablations.csv")
     args = parser.parse_args()
 
-    if args.compare:
-        compare()
-    else:
-        priors = HIER_PRIORS if args.prior == "hier" else FLAT_PRIORS
-        cfn = COST_OUTLET if args.cost == "outlet" else {o: COST_GENERAL for o in OBSERVED}
-        outlets = [args.outlet] if args.outlet else list(OBSERVED)
+    if args.ablations:
+        run_ablations(args.ablations)
+        return
 
-        for o in outlets:
-            pred = run(priors[o], cfn[o])
-            print(f"\n{o} ({args.prior}/{args.cost}):")
-            for u in Utterance:
-                print(f"  {UTT_NAMES[u]:<20} pred={float(pred[u]):.3f}  obs={float(OBSERVED[o][u]):.3f}")
-            print(f"  RMSE: {rmse(pred, OBSERVED[o]):.4f}")
+    print("\n" + "="*65)
+    print("QUD-RSA: Semantics + Informativity + Cost")
+    print("="*65)
+
+    for use_register, name in [(False, "Without Register"), (True, "With Register")]:
+        avg_rmse, params = fit_model(use_register=use_register)
+
+        print(f"\n{name}:")
+        print(f"  α={params['alpha']:.2f}, cost_w={params['cost_w']:.2f}")
+        print(f"  Avg RMSE: {avg_rmse:.4f}")
+
+        for outlet in ["Breitbart", "NPR", "PinkNews"]:
+            pred = predict(outlet, params['alpha'], params['cost_w'], use_register)
+            obs = OBSERVED[outlet]
+            r = rmse(pred, obs)
+            print(f"    {outlet}: pred=[{pred[0]:.3f}, {pred[1]:.3f}, {pred[2]:.3f}] "
+                  f"obs=[{float(obs[0]):.3f}, {float(obs[1]):.3f}, {float(obs[2]):.3f}] "
+                  f"RMSE={r:.4f}")
 
 if __name__ == "__main__":
     main()
