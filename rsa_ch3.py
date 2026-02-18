@@ -35,7 +35,7 @@ jax.config.update("jax_enable_x64", True)
 # DATA
 # =============================================================================
 
-DATA_PATH = "/Users/rxdh/Dropbox/Mac (2)/Downloads/small_production_data (1).csv"
+DATA_PATH = "small_production_data.csv"
 
 def load_data(path=DATA_PATH):
     return pd.read_csv(path)
@@ -56,7 +56,6 @@ I = jnp.arange(5)  # political identity: 0..4 → party_numeric 1..5
 U = jnp.arange(2)  # utterance: 0=gendered, 1=neutral
 
 IDENTITY_NAMES = ["StrongR", "LeanR", "Ind", "LeanD", "StrongD"]
-UTT_NAMES = ["gendered", "neutral"]
 
 # =============================================================================
 # PRIORS
@@ -65,7 +64,7 @@ UTT_NAMES = ["gendered", "neutral"]
 def make_prior(df):
     """Prior over identities from participant proportions."""
     worker_counts = df.groupby('party_numeric')['workerid'].nunique()
-    prior = jnp.array([worker_counts.get(i + 1, 1) for i in range(5)], dtype=float)
+    prior = jnp.array([worker_counts.get(i + 1, 0) for i in range(5)], dtype=float)
     return prior / prior.sum()
 
 # =============================================================================
@@ -159,9 +158,6 @@ def predict_lexeme(alpha, beta0, beta1, w, log_rel_freq, prior):
     costs = make_costs(log_rel_freq)
     s1 = S1(alpha, w, prior=prior, compat_matrix=compat_matrix, costs=costs)
     return np.array(s1[:, 1])  # P(neutral) for each identity
-
-def rmse(pred, obs):
-    return float(np.sqrt(np.mean((np.array(pred) - np.array(obs)) ** 2)))
 
 # =============================================================================
 # FITTING
@@ -316,6 +312,11 @@ def main():
 
     if args.lexeme:
         observed = observed[observed['lexeme'] == args.lexeme]
+        if observed.empty:
+            available = sorted(df['lexeme'].unique())
+            print(f"Error: lexeme '{args.lexeme}' not found.")
+            print(f"Available: {', '.join(available)}")
+            return
 
     print("\n" + "=" * 70)
     print("RSA Ch3: Neutral Role Noun Production")
